@@ -1,6 +1,21 @@
 
 # nanoGPT
 
+## CS 229s
+
+We will be building off of this codebase for the [CS 229s Systems for Machine Learning](https://cs229s.stanford.edu/fall2023/) default final project option. The project training will be on the Wikitext103 language modeling dataset (which will be automatically downloaded from huggingface). You can also use a Shakespeare dataset to help debug (this dataset is tiny!).
+
+This repo includes ```prepare.py``` scripts to prepare the datasets for training:
+- ```python data/wikitext/prepare.py```
+- ```python data/shakespeare/prepare.py```
+
+Next, the repo includes configs to launch training:
+- ```python train.py config/train_wikitext.py```
+- ```python train.py config/train_shakespeare.py```
+
+Additional instructions for the course project, training settings (hyperparameters, model sizes, batch sizes, etc.) are detailed in the provided project writeup. The original README is retained below. Please reference the Install section to install the required libraries. 
+
+
 ![nanoGPT](assets/nanogpt.jpg)
 
 The simplest, fastest repository for training/finetuning medium-sized GPTs. It is a rewrite of [minGPT](https://github.com/karpathy/minGPT) that prioritizes teeth over education. Still under active development, but currently the file `train.py` reproduces GPT-2 (124M) on OpenWebText, running on a single 8XA100 40GB node in about 4 days of training. The code itself is plain and readable: `train.py` is a ~300-line boilerplate training loop and `model.py` a ~300-line GPT model definition, which can optionally load the GPT-2 weights from OpenAI. That's it.
