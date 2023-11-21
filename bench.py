@@ -1,5 +1,6 @@
 """
 A much shorter version of train.py for benchmarking
+
 """
 import os
 from contextlib import nullcontext
