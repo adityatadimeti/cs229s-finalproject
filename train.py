@@ -271,7 +271,25 @@ while True:
         # compute weights with lowest magnitudes, prune
         #raw_model.weights
     if(iter_num == 100):
-        prune.ln_structured(raw_model, name="weight", amount=0.9, n = 2, dim=0) # pruning after 100 layers, 90% done
+        # prune.ln_structured(raw_model, name="weight", amount=0.9, n = 2, dim=0) # pruning after 100 layers, 90% done
+
+        # prune the bottom 90% of the weights without the prune.ln_structured function library call. 
+        import torch.nn.utils.prune as prune
+
+        # Get all the parameters of the model
+        parameters = list(raw_model.parameters())
+
+        # Sort the parameters based on their magnitudes
+        sorted_parameters = sorted(parameters, key=lambda p: torch.norm(p))
+
+        # Calculate the index to prune up to
+        prune_index = int(len(sorted_parameters) * 0.9)
+
+        # Prune the bottom 90% of the weights
+        for param in sorted_parameters[:prune_index]:
+            # param.data *= (torch.abs(param.data) > 0).float()
+            param.data = torch.zeros_like(param.data)
+
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
@@ -348,4 +366,5 @@ while True:
 
 if ddp:
     destroy_process_group()
+
 
