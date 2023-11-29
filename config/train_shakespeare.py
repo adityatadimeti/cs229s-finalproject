@@ -6,7 +6,7 @@ out_dir = 'shakespeare'
 #eval_interval = 10
 #eval_iters = 50
 eval_interval = 1
-eval_iters = 2
+eval_iters = 4
 
 # logging
 #log_interval = 10
@@ -27,7 +27,7 @@ always_save_checkpoint = False
 batch_size = 8
 gradient_accumulation_steps = 40
 #max_iters = 200
-max_iters = 2
+max_iters = 4
 
 # finetune at constant LR
 learning_rate = 3e-5

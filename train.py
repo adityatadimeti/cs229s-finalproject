@@ -40,8 +40,7 @@ from tqdm import tqdm # progress bar library
 out_dir = 'out'
 eval_interval = 2000
 log_interval = 1
-#eval_iters = 200
-eval_iters = 2
+eval_iters = 500
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'gpt2' # 'scratch' or 'resume' or 'gpt2*'
@@ -275,21 +274,24 @@ Step by step:
 """
 
 mask_dict = {} # moving this outside while training loop so mask_dict is not reinitlized for each iteration
-for name, param in raw_model.named_parameters():
+for name, param in model.named_parameters():
     mask_dict[name] = torch.ones_like(param) # note that we can use name as a key because each name is unique per layer/type
     #print(name, mask_dict[name])
 
 # Calculate the percentage of data values across all entries of all weight matrices across all parameters that equal 0
-total_values = 0
-zero_values = 0
+# total_values = 0
+# zero_values = 0
 
-for name, param in raw_model.named_parameters():
-    if "weight" in name:
-        total_values += param.numel()
-        zero_values += (param == 0).sum().item()
+# for name, param in model.named_parameters():
+#     if "weight" in name:
+#         total_values += param.numel()
+#         zero_values += (param == 0).sum().item()
 
-percent_zero_values = (zero_values / total_values) * 100
-print("Percentage of weight values that equal 0:", percent_zero_values)
+# percent_zero_values = (zero_values / total_values) * 100
+#print("Percentage of weight values that equal 0:", percent_zero_values)
+
+file_path = 'prune_data_'+str(eval_iters)+'_'+str(batch_size)+'.pickle'
+
 
 while True:
     print("INSIDE ITERATION " , iter_num)
@@ -298,30 +300,80 @@ while True:
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
    
-    if (iter_num == 1):
-
+    if (iter_num == 100):
+        print("time to prune")
         # create a lambda function that flattens all parameters that have "weight" in name
-        flatten_parameters = lambda: [param.data.flatten() for name, param in model.named_parameters() if "weight" in name]
+        fn = file_path
+        if os.path.isfile(fn):
+            print("pckle file exists")
+            with open(fn, 'rb') as f:
+                prune_val = pickle.load(f)
+                iter_num = pickle.load(f)
+                #flattened_parameters = pickle.load(f)
+                #sorted_list = pickle.load(f)
+                mask_dict = pickle.load(f)
+                batch_size = pickle.load(f)
 
-        # flatten the parameters and sort them by their magnitudes
-        flattened_parameters = flatten_parameters() # this is a list of tensors
-        flattened_and_concatenated = [tensor.tolist() for tensor in flattened_parameters]
-        flattened_and_concatenated = [item for sublist in flattened_and_concatenated for item in sublist]
-        sorted_list = sorted(flattened_and_concatenated, key=abs, reverse=True)
+                for name, param in model.named_parameters():
+                    if "weight" in name:
+                        # this is a weight parameter
+                        mask_dict[name][torch.abs(param.data) < prune_val] = 0
+                        print(name, mask_dict[name])
+                        with torch.no_grad(): # freezes the grad for the entire matrix??? or just the mask?
+                            param *= mask_dict[name]
+        
+        else:
+            print("no pickle file, so running manual process")
 
-        # find the index to prune up to
-        prune_index = int(len(sorted_list) * 0.1)
-        prune_val = sorted_list[prune_index]
+            layer_weights_count = 0
+            flattened_tensors = []
+            for name, param in model.named_parameters():
+                if 'weight' in name:
+                    flattened_tensors.append(param.data.flatten())
+                    layer_weights_count += param.data.flatten().numel()
+                    print(layer_weights_count)
+            flattened_weights = torch.cat(flattened_tensors)
+            sorted_indices = torch.argsort(torch.abs(flattened_weights), descending=True)
+            sorted_flattened_weights = flattened_weights[sorted_indices]
+            #print(sorted_flattened_weights)
+            threshold_index = int(layer_weights_count/10 + 1)
+            #print(sorted_flattened_weights[threshold_index])
+            prune_val = abs(sorted_flattened_weights[threshold_index])
 
-        # prune_val = -0.1 # hard coding this for debugging purposes
+            # flatten_parameters = lambda: [param.data.flatten() for name, param in model.named_parameters() if "weight" in name]
 
-        for name, param in model.named_parameters():
-            if "weight" in name:
-                # this is a weight parameter
-                mask_dict[name][param.data < prune_val] = 0
-                print(name, mask_dict[name])
-                with torch.no_grad(): # freezes the grad for the entire matrix??? or just the mask?
-                    param *= mask_dict[name]
+            # # flatten the parameters and sort them by their magnitudes
+            # flattened_parameters = flatten_parameters() # this is a list of tensors
+            # flattened_and_concatenated = [tensor.tolist() for tensor in flattened_parameters]
+            # flattened_and_concatenated = [item for sublist in flattened_and_concatenated for item in sublist]
+            # sorted_list = sorted(flattened_and_concatenated, key=abs, reverse=True)
+
+            # find the index to prune up to
+            # prune_index = int(len(sorted_list) * 0.1)
+            # prune_val = sorted_list[prune_index]
+            print("done with evaluations, starting to save")
+
+            #save this variable data to the pickle file
+            with open(file_path, 'wb') as f:
+                pickle.dump(prune_val, f)
+                pickle.dump(iter_num, f)
+                #pickle.dump(flattened_parameters, f)
+                #pickle.dump(sorted_list, f)
+                pickle.dump(mask_dict, f)
+                pickle.dump(batch_size, f)
+            print("saved")
+
+            for name, param in model.named_parameters():
+                if "weight" in name:
+                    # this is a weight parameter
+                    #print("sum of weights before pruning", torch.sum(torch.abs(param.data)))
+                    mask_dict[name][torch.abs(param.data) < prune_val] = 0
+                    #print(name, mask_dict[name])
+                    with torch.no_grad(): # freezes the grad for the entire matrix??? or just the mask?
+                        param *= mask_dict[name]
+        # prune_val = 0.4 # hard coding this for debugging purposes
+
+        
         
         #print(len(sorted_list), prune_val, max(sorted_list), min(sorted_list))
     
@@ -331,18 +383,20 @@ while True:
                 with torch.no_grad(): # freezes the grad for the entire matrix??? or just the mask?
                     param *= mask_dict[name]
 
+        
+
     
     # Calculate the percentage of data values across all entries of all weight matrices across all parameters that equal 0
-    total_values = 0
-    zero_values = 0
+    # total_values = 0
+    # zero_values = 0
 
-    for name, param in raw_model.named_parameters():
-        if "weight" in name:
-            total_values += param.numel()
-            zero_values += (param == 0).sum().item()
+    # for name, param in raw_model.named_parameters():
+    #     if "weight" in name:
+    #         total_values += param.numel()
+    #         zero_values += (param == 0).sum().item()
 
-    percent_zero_values = (zero_values / total_values) * 100
-    print("Percentage of weight values that equal 0:", percent_zero_values)
+    # percent_zero_values = (zero_values / total_values) * 100
+    # print("Percentage of weight values that equal 0:", percent_zero_values)
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
