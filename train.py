@@ -1,3 +1,5 @@
+
+
 """
 This training script can be run both on a single gpu in debug mode,
 and also in a larger training run with distributed data parallel (ddp).
@@ -28,6 +30,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
+
+import torch.nn.utils.prune as prune # pruning library
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -249,12 +253,25 @@ t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
-while True:
 
+# import torch.nn.utils.prune as prune
+
+#prune.l1_unstructured(module, name="bias", amount=3)
+
+
+while True:
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
+
+    # if(iter_num % 100 == 0):
+    #     print("Pruning at iteration ", iter_num)
+        #prune here
+        # compute weights with lowest magnitudes, prune
+        #raw_model.weights
+    if(iter_num == 100):
+        prune.ln_structured(raw_model, name="weight", amount=0.9, n = 2, dim=0) # pruning after 100 layers, 90% done
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
@@ -331,3 +348,4 @@ while True:
 
 if ddp:
     destroy_process_group()
+
