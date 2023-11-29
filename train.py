@@ -32,6 +32,7 @@ from torch.distributed import init_process_group, destroy_process_group
 from model import GPTConfig, GPT
 
 import torch.nn.utils.prune as prune # pruning library
+from tqdm import tqdm # progress bar library
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -39,10 +40,11 @@ import torch.nn.utils.prune as prune # pruning library
 out_dir = 'out'
 eval_interval = 2000
 log_interval = 1
-eval_iters = 200
+#eval_iters = 200
+eval_iters = 2
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
-init_from = 'gpt2-medium' # 'scratch' or 'resume' or 'gpt2*'
+init_from = 'gpt2' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
 wandb_log = False # disabled by default
 wandb_project = 'cs229s'
@@ -259,37 +261,88 @@ running_mfu = -1.0
 #prune.l1_unstructured(module, name="bias", amount=3)
 
 
+"""
+overall: take top 10% of weights ACROSS ALL parameters, not just individual parameters. certain parameters are weights and certain ones are biases. 
+Step by step:
+1 - identify parameters that are weight parameters
+2 - coalesce all the weight parameters via flatten, which puts them into a single list
+3 - reverse - sort them and identify the weight value that's at the 10% mark
+4 - then you develop a mask, per weight parameter (i.e. for each parameter thats a weight), 
+    that is 1 if the weight is above the 10% mark, and 0 if it's below the 10% mark. 
+    note that this mask is fixed for each weight parameter, so the mask never changes. 
+5 - you repeatedly multiply this mask with the weight parameter since there are occasisins where the weight
+    parameter is 0 and then becomes nonzero because it gets learned. we want to prevent this. 
+"""
+
+mask_dict = {} # moving this outside while training loop so mask_dict is not reinitlized for each iteration
+for name, param in raw_model.named_parameters():
+    mask_dict[name] = torch.ones_like(param) # note that we can use name as a key because each name is unique per layer/type
+    #print(name, mask_dict[name])
+
+# Calculate the percentage of data values across all entries of all weight matrices across all parameters that equal 0
+total_values = 0
+zero_values = 0
+
+for name, param in raw_model.named_parameters():
+    if "weight" in name:
+        total_values += param.numel()
+        zero_values += (param == 0).sum().item()
+
+percent_zero_values = (zero_values / total_values) * 100
+print("Percentage of weight values that equal 0:", percent_zero_values)
+
 while True:
+    print("INSIDE ITERATION " , iter_num)
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
+   
+    if (iter_num == 1):
 
-    # if(iter_num % 100 == 0):
-    #     print("Pruning at iteration ", iter_num)
-        #prune here
-        # compute weights with lowest magnitudes, prune
-        #raw_model.weights
-    if(iter_num == 100):
-        # prune.ln_structured(raw_model, name="weight", amount=0.9, n = 2, dim=0) # pruning after 100 layers, 90% done
+        # create a lambda function that flattens all parameters that have "weight" in name
+        flatten_parameters = lambda: [param.data.flatten() for name, param in model.named_parameters() if "weight" in name]
 
-        # prune the bottom 90% of the weights without the prune.ln_structured function library call. 
-        import torch.nn.utils.prune as prune
+        # flatten the parameters and sort them by their magnitudes
+        flattened_parameters = flatten_parameters() # this is a list of tensors
+        flattened_and_concatenated = [tensor.tolist() for tensor in flattened_parameters]
+        flattened_and_concatenated = [item for sublist in flattened_and_concatenated for item in sublist]
+        sorted_list = sorted(flattened_and_concatenated, key=abs, reverse=True)
 
-        # Get all the parameters of the model
-        parameters = list(raw_model.parameters())
+        # find the index to prune up to
+        prune_index = int(len(sorted_list) * 0.1)
+        prune_val = sorted_list[prune_index]
 
-        # Sort the parameters based on their magnitudes
-        sorted_parameters = sorted(parameters, key=lambda p: torch.norm(p))
+        # prune_val = -0.1 # hard coding this for debugging purposes
 
-        # Calculate the index to prune up to
-        prune_index = int(len(sorted_parameters) * 0.9)
+        for name, param in model.named_parameters():
+            if "weight" in name:
+                # this is a weight parameter
+                mask_dict[name][param.data < prune_val] = 0
+                print(name, mask_dict[name])
+                with torch.no_grad(): # freezes the grad for the entire matrix??? or just the mask?
+                    param *= mask_dict[name]
+        
+        #print(len(sorted_list), prune_val, max(sorted_list), min(sorted_list))
+    
+    else:
+        for name, param in model.named_parameters():
+            if "weight" in name:
+                with torch.no_grad(): # freezes the grad for the entire matrix??? or just the mask?
+                    param *= mask_dict[name]
 
-        # Prune the bottom 90% of the weights
-        for param in sorted_parameters[:prune_index]:
-            # param.data *= (torch.abs(param.data) > 0).float()
-            param.data = torch.zeros_like(param.data)
+    
+    # Calculate the percentage of data values across all entries of all weight matrices across all parameters that equal 0
+    total_values = 0
+    zero_values = 0
 
+    for name, param in raw_model.named_parameters():
+        if "weight" in name:
+            total_values += param.numel()
+            zero_values += (param == 0).sum().item()
+
+    percent_zero_values = (zero_values / total_values) * 100
+    print("Percentage of weight values that equal 0:", percent_zero_values)
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
