@@ -618,4 +618,65 @@ class GPT(nn.Module):
             
             print(f"speculative decoding ran for {loop_counter} iterations")
         return idx[:,:idx_length_original+max_new_tokens]
+    
+    @torch.no_grad()
+    #this assumes that the draft model is quantized
+    def generate_speculative_with_quant(self, idx, max_new_tokens, draft_model, temperature=1.0, top_k=None, num_speculative=4, max_vals=None):
+   
+        idx_length_original = idx.size(1)
+        
+        loop_counter = 0
+        while idx.size(1) < idx_length_original+max_new_tokens:
+            loop_counter += 1
 
+            # if the sequence context is growing too long we must crop it at block_size
+            idx_cond = idx if idx.size(1) <= self.config.block_size -num_speculative else idx[:, -self.config.block_size -num_speculative:]
+
+            # Generate speculative tokens from the draft model. Then, run it through the main model.
+            # Be sure to set top_k=1, otherwise you'll pollute the RNG! (Which will make your code harder to debug.)
+
+            ### YOUR CODE HERE
+
+            # use the draft_model to generate speculative tokens
+            idx_speculative = draft_model.generate(idx_cond, num_speculative, temperature=temperature, top_k=1, isQuant=True, max_vals=max_vals)
+
+            # obtain the logits from the main model by passing in the idx_speculative
+            all_logits, _ = self.forward_quantize(idx_speculative, max_vals=max_vals)
+            
+            ### END YOUR CODE HERE
+
+            # Step through the predictions of the main model, sampling, and check whether they match the next token. Stop upon mismatch.
+
+            ### YOUR CODE HERE
+
+            # iterate from the end position of idx_cond (prefix sequence) to the end position of idx_speculative (generated sequence)
+            
+            for i in range(idx_cond.size(1)-1, idx_speculative.size(1)-1):
+
+                # pluck the logits at the current position and scale by desired temperature
+                logits = all_logits[:, i, :] / temperature
+
+                # optionally crop the logits to only the top k options
+                if top_k is not None:
+                    if top_k == 1:
+                        pass
+                    else:
+                        v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                        logits[logits < v[:, [-1]]] = -float('Inf')
+
+                # apply softmax to convert logits to (normalized) probabilities
+                probs = F.softmax(logits, dim=-1)
+
+                # sample from the distribution with temperature
+                idx_next = torch.multinomial(probs, num_samples=1)
+
+                # append sampled index to the running sequence and continue
+                idx = torch.cat((idx, idx_next), dim=1)
+
+                # end the loop if the next token does not match the next token in idx_speculative
+                if idx_next != idx_speculative[:, i+1]:
+                    break
+
+            ### END YOUR CODE HERE
+            print(f"speculative decoding with draft as quantized ran for {loop_counter} iterations")
+        return idx[:,:idx_length_original+max_new_tokens]

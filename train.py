@@ -216,7 +216,24 @@ if compile:
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 
-# helps estimate an arbitrarily accurate loss over either split using many batches
+
+#save the model info here
+# checkpoint = {
+#     'model': model.state_dict(),
+#     'optimizer': optimizer.state_dict(),
+#     'model_args': model_args,
+#     'iter_num': iter_num,
+#     'best_val_loss': best_val_loss,
+#     'config': config,
+# }
+# out_dir='pretrained-medium'
+# print(f"saving checkpoint to {out_dir}")
+# torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+# print(f"done saving")
+
+
+
+#helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
 def estimate_loss():
     out = {}
@@ -489,26 +506,27 @@ if ddp:
 #this is outside, at the end, of the training file
 
 def quantize_param(param): #this data is the param data
-    rangemin = -128
-    rangemax = 127
+    
+    abs_max = torch.max(torch.abs(param))
+    scaled_tensor = param / abs_max
+    scaled_tensor = (scaled_tensor * 127.)
 
-    maxval = torch.max(torch.abs(param))
-
-    #scaled tensor
-    scaling_factor = rangemax / maxval
-    scaled_tensor = param * scaling_factor
-
-    clipped_tensor = torch.clamp(scaled_tensor, rangemin, rangemax)
-    quantized_tensor = torch.round(clipped_tensor)
+    clipped_tensor = torch.clamp(scaled_tensor, -127., 127.)
+    quantized_tensor = clipped_tensor.to(torch.int8)
     quantized_tensor = quantized_tensor.to(torch.int8)
-    quantized_tensor.requires_grad = False
-    return quantized_tensor, maxval
+    return quantized_tensor, abs_max
     
 
 def dequantize_param(param, maxval):
-    rangemax = 127
+    """ rangemax = 127
     dequantized_tensor = param.to(torch.float16)
     dequantized_tensor = dequantized_tensor / rangemax * maxval
+    return dequantized_tensor """
+
+    rangemax = 127
+    dequantized_tensor = param.to(torch.float32)
+    dequantized_tensor = dequantized_tensor / rangemax * maxval
+    dequantized_tensor = dequantized_tensor.to(torch.float32)
     return dequantized_tensor
 
 
@@ -620,20 +638,39 @@ with torch.no_grad():
 
 
 #part 3
-##speculative decoding and onwards is here
 
-#run speculative decoding on the model
-""" generations_spec = []
+#standard decoding
+generations_naive = []
 with torch.no_grad():
     with ctx:
         for k in range(num_samples):
             torch.manual_seed(k+1337) # we want consistency
-            y = model.generate_speculative(x, max_new_tokens, draft_model, temperature=temperature, top_k=top_k)
+            y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
+            generations_naive.append(y[0].tolist())
+            print(decode(generations_naive[-1]))
+            print('---------------')
+
+# let M be the main model = gpt2-medium decoding with speculative decoding when D is the draft model = gpt2. 
+print('Loading draft model')
+draft_model = GPT.from_pretrained('gpt2', dict(dropout=0.0))
+draft_model.eval()
+draft_model.to(device)
+
+generations_spec = []
+with torch.no_grad():
+    with ctx:
+        for k in range(num_samples):
+            torch.manual_seed(k+1337) # we want consistency
+            y = model.generate_speculative_with_quant(x, max_new_tokens, draft_model, temperature=temperature, top_k=top_k)
             generations_spec.append(y[0].tolist())
             print(decode(generations_spec[-1]))
-            print('---------------') """
+            print('---------------')
 
-#num_speculative is always 4
+#part 4
+#Now, let the post-training quantized M be the main model.
+#speculative decoding when: your quantized version of M is the draft model 
+
+
 
 
 
