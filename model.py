@@ -16,61 +16,42 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 
-def quantize_param(param): #this data is the param data
-    """ rangemin = -128
-    rangemax = 127
-
-    maxval = torch.max(torch.abs(param))
-
-    #scaled tensor
-    scaling_factor = rangemax / maxval
-    scaled_tensor = param * scaling_factor
-
-    clipped_tensor = torch.clamp(scaled_tensor, rangemin, rangemax)
-    quantized_tensor = torch.round(clipped_tensor)
-    quantized_tensor = quantized_tensor.to(torch.int8)
-    quantized_tensor.requires_grad = False
-    return quantized_tensor, maxval """
-
-    abs_max = torch.max(torch.abs(param))
-    scaled_tensor = param / abs_max
-    scaled_tensor = (scaled_tensor * 127.)
-
-    clipped_tensor = torch.clamp(scaled_tensor, -127., 127.)
-    quantized_tensor = clipped_tensor.to(torch.int8)
-    quantized_tensor = quantized_tensor.to(torch.int8)
-    return quantized_tensor, abs_max
-    
-
-def dequantize_param(param, maxval):
-    rangemax = 127
+def dequantize_helper(param, maxval):
+    rangemax = 127.
     dequantized_tensor = param.to(torch.float32)
     dequantized_tensor = dequantized_tensor / rangemax * maxval
-    dequantized_tensor = dequantized_tensor.to(torch.float32)
     return dequantized_tensor
 
-def dequantize_module(module, self, paramname, max_vals, prevHierarchy):
-    #module is the actual param data
+def quantize_helper(param): #this data is the param data
+    rangemin = -128.
+    rangemax = 127.
     
+    maxval = torch.max(torch.abs(param))
+    scaled_tensor = param / maxval * rangemax
+
+    quantized_tensor = torch.clamp(scaled_tensor, rangemin, rangemax)
+    quantized_tensor = torch.round(quantized_tensor)
+    quantized_tensor = quantized_tensor.to(torch.int8)
+
+    quantized_tensor.requires_grad = False
+    return quantized_tensor, maxval
+
+def dequantize_and_update(module, self, paramname, max_vals, prevHierarchy):
+    #module is the actual param data
     if(prevHierarchy != ""):
         fullname = prevHierarchy +"." + paramname
     else:
         fullname = paramname
-    quantized_param = module.detach().clone()
-
     #print("MODULE DTYPE " + str(module.dtype))
-    dequantized_module = dequantize_param(module, max_vals[fullname + "_maxval"])
+    dequantized_module = dequantize_helper(module, max_vals[fullname + "_maxval"])
     self.state_dict()[paramname] = self.state_dict()[paramname].to(torch.float32)
     module.data = dequantized_module
     self.state_dict()[paramname].copy_(dequantized_module)
-
-    return quantized_param
-
-def quantize_module(module, quantdata, self, paramname):
+    
+def update_data(module, newdata, self, paramname):
     self.state_dict()[paramname] = self.state_dict()[paramname].to(torch.int8)
-    module.data = quantdata
+    module.data = newdata
     self.state_dict()[paramname].copy_(module)
-    #self.state_dict()[paramname].copy_(module)
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -82,7 +63,6 @@ class LayerNorm(nn.Module):
 
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
-    
 
     def forward_quantize(self, input, max_vals, prevHierarchy):
         #since we assume the weights are already quantized, we need to dequantize, then run the forward function, then re-quantize
@@ -92,7 +72,7 @@ class LayerNorm(nn.Module):
         for name, param in self.named_parameters():
             #print("PARAM DTYPE " + str(param.dtype))
             fullname = prevHierarchy +"." + name
-            dequantized = dequantize_param(param, max_vals[fullname + "_maxval"])
+            dequantized = dequantize_helper(param, max_vals[fullname + "_maxval"])
             self.state_dict()[name] = self.state_dict()[name].to(torch.float32)
             param.data = dequantized
             self.state_dict()[name].copy_(param)
@@ -107,7 +87,7 @@ class LayerNorm(nn.Module):
 
         #re-quantize
         for name, param in self.named_parameters():
-            quantized, maxval = quantize_param(param)
+            quantized, maxval = quantize_helper(param)
             fullname = prevHierarchy +"."+ name
             self.state_dict()[name] = self.state_dict()[name].to(torch.int8)
             param.data = quantized
@@ -170,12 +150,14 @@ class CausalSelfAttention(nn.Module):
     def forward_quantize(self, x, max_vals, prevHierarchy):
         B, T, C = x.size()
 
-        quantize_weight = dequantize_module(self.c_attn.weight, self, "c_attn.weight", max_vals, prevHierarchy)
-        quantize_bias = dequantize_module(self.c_attn.bias, self, "c_attn.bias", max_vals, prevHierarchy)
+        og_weight = self.c_attn.weight.clone()
+        dequantize_and_update(self.c_attn.weight, self, "c_attn.weight", max_vals, prevHierarchy)
+        og_bias = self.c_attn.bias.clone()
+        dequantize_and_update(self.c_attn.bias, self, "c_attn.bias", max_vals, prevHierarchy)
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        #quantize it back
-        quantize_module(self.c_attn.weight, quantize_weight, self, "c_attn.weight")
-        quantize_module(self.c_attn.bias, quantize_bias, self, "c_attn.bias")
+        #set the state back to the original, quantized value without having to quantize and lose even further precision
+        update_data(self.c_attn.weight, og_weight, self, "c_attn.weight")
+        update_data(self.c_attn.bias, og_bias, self, "c_attn.bias")
 
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
@@ -194,13 +176,15 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         #similarly need to dequantize first
-        quantize_weight = dequantize_module(self.c_proj.weight, self, "c_proj.weight", max_vals, prevHierarchy)
-        quantize_bias = dequantize_module(self.c_proj.bias, self, "c_proj.bias", max_vals, prevHierarchy)
+        og_weight = self.c_proj.weight.clone()
+        dequantize_and_update(self.c_proj.weight, self, "c_proj.weight", max_vals, prevHierarchy)
+        og_bias = self.c_proj.bias.clone()
+        dequantize_and_update(self.c_proj.bias, self, "c_proj.bias", max_vals, prevHierarchy)
         y = self.resid_dropout(self.c_proj(y))
-        #quantize it back
+        #set the state back to the original, quantized value without having to quantize and lose even further precision
         # output projection
-        quantize_module(self.c_proj.weight, quantize_weight, self, "c_proj.weight")
-        quantize_module(self.c_proj.bias, quantize_bias, self, "c_proj.bias")
+        update_data(self.c_proj.weight, og_weight, self, "c_proj.weight")
+        update_data(self.c_proj.bias, og_bias, self, "c_proj.bias")
 
         return y
 
@@ -221,21 +205,25 @@ class MLP(nn.Module):
         return x
     
     def forward_quantize(self, x, max_vals, prevHierarchy):
-        quantize_weight = dequantize_module(self.c_fc.weight, self, "c_fc.weight", max_vals, prevHierarchy)
-        quantize_bias = dequantize_module(self.c_fc.bias, self, "c_fc.bias", max_vals, prevHierarchy)
+        og_weight = self.c_fc.weight.clone()
+        dequantize_and_update(self.c_fc.weight, self, "c_fc.weight", max_vals, prevHierarchy)
+        og_bias = self.c_fc.bias.clone()
+        dequantize_and_update(self.c_fc.bias, self, "c_fc.bias", max_vals, prevHierarchy)
         x = self.c_fc(x)
-        #quantize it back
-        quantize_module(self.c_fc.weight, quantize_weight, self, "c_fc.weight")
-        quantize_module(self.c_fc.bias, quantize_bias, self, "c_fc.bias")
+        #set the state back to the original, quantized value without having to quantize and lose even further precision
+        update_data(self.c_fc.weight, og_weight, self, "c_fc.weight")
+        update_data(self.c_fc.bias, og_bias, self, "c_fc.bias")
 
         x = self.gelu(x)
 
-        quantize_weight = dequantize_module(self.c_proj.weight, self, "c_proj.weight", max_vals, prevHierarchy)
-        quantize_bias = dequantize_module(self.c_proj.bias, self, "c_proj.bias", max_vals, prevHierarchy)
+        og_weight = self.c_proj.weight.clone()
+        dequantize_and_update(self.c_proj.weight, self, "c_proj.weight", max_vals, prevHierarchy)
+        og_bias = self.c_proj.bias.clone()
+        dequantize_and_update(self.c_proj.bias, self, "c_proj.bias", max_vals, prevHierarchy)
         x = self.c_proj(x)
-        #quantize it back
-        quantize_module(self.c_proj.weight, quantize_weight, self, "c_proj.weight")
-        quantize_module(self.c_proj.bias, quantize_bias, self, "c_proj.bias")
+        #set the state back to the original, quantized value without having to quantize and lose even further precision
+        update_data(self.c_proj.weight, og_weight, self, "c_proj.weight")
+        update_data(self.c_proj.bias, og_bias, self, "c_proj.bias")
 
         x = self.dropout(x)
         return x
@@ -323,7 +311,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, myFlag=False):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -341,6 +329,9 @@ class GPT(nn.Module):
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        elif myFlag == True:
+            logits = self.lm_head(x)
+            loss = None
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
@@ -349,23 +340,25 @@ class GPT(nn.Module):
         return logits, loss
     
 
-    def forward_quantize(self, idx, targets=None, max_vals=None):
+    def forward_quantize(self, idx, targets=None, max_vals=None, myFlag=False):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device)
 
         # forward the GPT model itself
-        quantize_weight = dequantize_module(self.transformer.wte.weight, self, "transformer.wte.weight", max_vals, "")
+        og_weight = self.transformer.wte.weight.clone()
+        dequantize_and_update(self.transformer.wte.weight, self, "transformer.wte.weight", max_vals, "")
         tok_emb = self.transformer.wte(idx)
-        #quantize it back
-        quantize_module(self.transformer.wte.weight, quantize_weight, self, "transformer.wte.weight")
+        #set the state back to the original, quantized value without having to quantize and lose even further precision
+        update_data(self.transformer.wte.weight, og_weight, self, "transformer.wte.weight")
 
         #same for pos_emb
-        quantize_weight = dequantize_module(self.transformer.wpe.weight, self, "transformer.wpe.weight", max_vals, "")
+        og_weight = self.transformer.wpe.weight.clone()
+        dequantize_and_update(self.transformer.wpe.weight, self, "transformer.wpe.weight", max_vals, "")
         pos_emb = self.transformer.wpe(pos)
-        #quantize it back
-        quantize_module(self.transformer.wpe.weight, quantize_weight, self, "transformer.wpe.weight")
+        #set the state back to the original, quantized value without having to quantize and lose even further precision
+        update_data(self.transformer.wpe.weight, og_weight, self, "transformer.wpe.weight")
 
         x = self.transformer.drop(tok_emb + pos_emb)
         indexcount = 0
@@ -374,41 +367,22 @@ class GPT(nn.Module):
             indexcount+=1
         x = self.transformer.ln_f.forward_quantize(x, max_vals, "transformer.ln_f")
 
-        quantized_weight = dequantize_module(self.transformer.wte.weight, self, "transformer.wte.weight", max_vals, "")
+        og_weight = self.transformer.wte.weight.clone()
+        dequantize_and_update(self.transformer.wte.weight, self, "transformer.wte.weight", max_vals, "")
+        
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        elif myFlag == True:
+            logits = self.lm_head(x)
+            loss = None
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
-        quantize_module(self.transformer.wte.weight, quantized_weight, self, "transformer.wte.weight")
+        update_data(self.transformer.wte.weight, og_weight, self, "transformer.wte.weight")
         return logits, loss
-    
-    """ def quantize(self):
-        for name, param in self.named_parameters():
-            if ".wte." in name or ".wpe." in name or "weight" in name:
-                param, maxval = quantize_param(param)
-                self.state_dict()[name].copy_(param)
-                #setattr(self, name + "_maxval", maxval)
-                max_vals[name+"_maxval"] = maxval
-
-        for index in range(len(self.transformer.h)):
-            self.transformer.h[index].quantize()
-
-        self.transformer.ln_f.quantize()
-
-    def quantize_total(self):
-        for name, param in self.named_parameters():
-            param, maxval = quantize_param(param)
-            self.state_dict()[name].copy_(param)
-            setattr(self, name + "_maxval", maxval)
-    
-    def dequantize_total(self):
-        for name, param in self.named_parameters():
-            param = dequantize_param(param, getattr(self, name + "_maxval"))
-            self.state_dict()[name].copy_(param) """
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -430,7 +404,7 @@ class GPT(nn.Module):
         from transformers import GPT2LMHeadModel
         print("loading weights from pretrained gpt: %s" % model_type)
 
-        # n_layer, n_head and n_embd are determined from model_type
+        # n_layer, n_head and n_embd are deterdequantize_and_updated from model_type
         config_args = {
             'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
             'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
@@ -531,7 +505,7 @@ class GPT(nn.Module):
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
         for _ in range(max_new_tokens):
-            print("next token " + str(_))
+            #print("next token " + str(_))
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
 
@@ -558,7 +532,7 @@ class GPT(nn.Module):
     
     @torch.no_grad()
     
-    def generate_speculative(self, idx, max_new_tokens, draft_model, temperature=1.0, top_k=None, num_speculative=4):
+    def generate_speculative(self, idx, max_new_tokens, draft_model, temperature=1.0, top_k=None, num_speculative=4, isMainModelQuantize=False, isDraftModelQuantize=False, max_vals=None):
    
         idx_length_original = idx.size(1)
         
@@ -575,10 +549,16 @@ class GPT(nn.Module):
             ### YOUR CODE HERE
 
             # use the draft_model to generate speculative tokens
-            idx_speculative = draft_model.generate(idx_cond, num_speculative, temperature=temperature, top_k=1)
-
+            if(isDraftModelQuantize):
+                idx_speculative = draft_model.generate(idx_cond, num_speculative, temperature=temperature, top_k=top_k, isQuantize=True, max_vals=max_vals)
+            else:
+                idx_speculative = draft_model.generate(idx_cond, num_speculative, temperature=temperature, top_k=top_k)
+            
             # obtain the logits from the main model by passing in the idx_speculative
-            all_logits, _ = self(idx_speculative)
+            if(isMainModelQuantize):
+                all_logits, _ = self.forward_quantize(idx_speculative, myFlag=True, max_vals=max_vals)
+            else:
+                all_logits, _ = self.forward(idx_speculative, myFlag=True)
             
             ### END YOUR CODE HERE
 
@@ -616,67 +596,67 @@ class GPT(nn.Module):
                 
             ### END YOUR CODE HERE
             
-            print(f"speculative decoding ran for {loop_counter} iterations")
+            #print(f"speculative decoding ran for {loop_counter} iterations")
         return idx[:,:idx_length_original+max_new_tokens]
     
-    @torch.no_grad()
-    #this assumes that the draft model is quantized
-    def generate_speculative_with_quant(self, idx, max_new_tokens, draft_model, temperature=1.0, top_k=None, num_speculative=4, max_vals=None):
+    # @torch.no_grad()
+    # #this assumes that the draft model is quantized
+    # def generate_speculative_with_quant(self, idx, max_new_tokens, draft_model, temperature=1.0, top_k=None, num_speculative=4, max_vals=None):
    
-        idx_length_original = idx.size(1)
+    #     idx_length_original = idx.size(1)
         
-        loop_counter = 0
-        while idx.size(1) < idx_length_original+max_new_tokens:
-            loop_counter += 1
+    #     loop_counter = 0
+    #     while idx.size(1) < idx_length_original+max_new_tokens:
+    #         loop_counter += 1
 
-            # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx if idx.size(1) <= self.config.block_size -num_speculative else idx[:, -self.config.block_size -num_speculative:]
+    #         # if the sequence context is growing too long we must crop it at block_size
+    #         idx_cond = idx if idx.size(1) <= self.config.block_size -num_speculative else idx[:, -self.config.block_size -num_speculative:]
 
-            # Generate speculative tokens from the draft model. Then, run it through the main model.
-            # Be sure to set top_k=1, otherwise you'll pollute the RNG! (Which will make your code harder to debug.)
+    #         # Generate speculative tokens from the draft model. Then, run it through the main model.
+    #         # Be sure to set top_k=1, otherwise you'll pollute the RNG! (Which will make your code harder to debug.)
 
-            ### YOUR CODE HERE
+    #         ### YOUR CODE HERE
 
-            # use the draft_model to generate speculative tokens
-            idx_speculative = draft_model.generate(idx_cond, num_speculative, temperature=temperature, top_k=1, isQuant=True, max_vals=max_vals)
+    #         # use the draft_model to generate speculative tokens
+    #         idx_speculative = draft_model.generate(idx_cond, num_speculative, temperature=temperature, top_k=1, isQuant=True, max_vals=max_vals)
 
-            # obtain the logits from the main model by passing in the idx_speculative
-            all_logits, _ = self.forward_quantize(idx_speculative, max_vals=max_vals)
+    #         # obtain the logits from the main model by passing in the idx_speculative
+    #         all_logits, _ = self.forward_quantize(idx_speculative, max_vals=max_vals)
             
-            ### END YOUR CODE HERE
+    #         ### END YOUR CODE HERE
 
-            # Step through the predictions of the main model, sampling, and check whether they match the next token. Stop upon mismatch.
+    #         # Step through the predictions of the main model, sampling, and check whether they match the next token. Stop upon mismatch.
 
-            ### YOUR CODE HERE
+    #         ### YOUR CODE HERE
 
-            # iterate from the end position of idx_cond (prefix sequence) to the end position of idx_speculative (generated sequence)
+    #         # iterate from the end position of idx_cond (prefix sequence) to the end position of idx_speculative (generated sequence)
             
-            for i in range(idx_cond.size(1)-1, idx_speculative.size(1)-1):
+    #         for i in range(idx_cond.size(1)-1, idx_speculative.size(1)-1):
 
-                # pluck the logits at the current position and scale by desired temperature
-                logits = all_logits[:, i, :] / temperature
+    #             # pluck the logits at the current position and scale by desired temperature
+    #             logits = all_logits[:, i, :] / temperature
 
-                # optionally crop the logits to only the top k options
-                if top_k is not None:
-                    if top_k == 1:
-                        pass
-                    else:
-                        v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                        logits[logits < v[:, [-1]]] = -float('Inf')
+    #             # optionally crop the logits to only the top k options
+    #             if top_k is not None:
+    #                 if top_k == 1:
+    #                     pass
+    #                 else:
+    #                     v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+    #                     logits[logits < v[:, [-1]]] = -float('Inf')
 
-                # apply softmax to convert logits to (normalized) probabilities
-                probs = F.softmax(logits, dim=-1)
+    #             # apply softmax to convert logits to (normalized) probabilities
+    #             probs = F.softmax(logits, dim=-1)
 
-                # sample from the distribution with temperature
-                idx_next = torch.multinomial(probs, num_samples=1)
+    #             # sample from the distribution with temperature
+    #             idx_next = torch.multinomial(probs, num_samples=1)
 
-                # append sampled index to the running sequence and continue
-                idx = torch.cat((idx, idx_next), dim=1)
+    #             # append sampled index to the running sequence and continue
+    #             idx = torch.cat((idx, idx_next), dim=1)
 
-                # end the loop if the next token does not match the next token in idx_speculative
-                if idx_next != idx_speculative[:, i+1]:
-                    break
+    #             # end the loop if the next token does not match the next token in idx_speculative
+    #             if idx_next != idx_speculative[:, i+1]:
+    #                 break
 
-            ### END YOUR CODE HERE
-            print(f"speculative decoding with draft as quantized ran for {loop_counter} iterations")
-        return idx[:,:idx_length_original+max_new_tokens]
+    #         ### END YOUR CODE HERE
+    #         print(f"speculative decoding with draft as quantized ran for {loop_counter} iterations")
+    #     return idx[:,:idx_length_original+max_new_tokens]
