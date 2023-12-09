@@ -72,21 +72,21 @@ start_ids = encode(start)
 x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
 
 
-#WITHOUT QUANTIZATION
-print("WITHOUT QUANTIZATION")
-with torch.no_grad():
-    with ctx:
-        for k in range(num_samples):
-            #y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
-            y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k, isQuantize=False)
-            print(decode(y[0].tolist()))
-            print('---------------')
+# #WITHOUT QUANTIZATION
+# print("WITHOUT QUANTIZATION")
+# with torch.no_grad():
+#     with ctx:
+#         for k in range(num_samples):
+#             #y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
+#             y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k, isQuantize=False)
+#             print(decode(y[0].tolist()))
+#             print('---------------')
 
 
 
 
 
-#WITHOUT QUANTIZATION
+#WITH QUANTIZATION
 print("WITH QUANTIZATION")
 
 def perplexity_score(probs: np.ndarray) -> float:
@@ -94,26 +94,23 @@ def perplexity_score(probs: np.ndarray) -> float:
     return np.exp(-np.mean(np.log(probs)))
 
 def quantize_param(param): #this data is the param data
-    
-    abs_max = torch.max(torch.abs(param))
-    scaled_tensor = param / abs_max
-    scaled_tensor = (scaled_tensor * 127.)
 
-    clipped_tensor = torch.clamp(scaled_tensor, -127., 127.)
+    rangemin = -128
+    rangemax = 127
+    
+    maxval = torch.max(torch.abs(param))
+    scaling_factor = rangemax / maxval
+    scaled_tensor = param * scaling_factor
+
+    clipped_tensor = torch.clamp(scaled_tensor, rangemin, rangemax)
     quantized_tensor = clipped_tensor.to(torch.int8)
-    quantized_tensor = quantized_tensor.to(torch.int8)
-    return quantized_tensor, abs_max
+    quantized_tensor.requires_grad = False
+    return quantized_tensor, maxval
     
 
 def dequantize_param(param, maxval):
-    """ rangemax = 127
-    dequantized_tensor = param.to(torch.float16)
-    dequantized_tensor = dequantized_tensor / rangemax * maxval
-    return dequantized_tensor """
-
     rangemax = 127
-    dequantized_tensor = param.to(torch.float32)
-    dequantized_tensor = dequantized_tensor / rangemax * maxval
+    dequantized_tensor = param / rangemax * maxval
     dequantized_tensor = dequantized_tensor.to(torch.float32)
     return dequantized_tensor
 
@@ -159,110 +156,110 @@ with torch.no_grad():
 
 
 
-print("3 and 4 stuff")
+# print("3 and 4 stuff")
 
-#PART 3 AND 4
+# #PART 3 AND 4
 
 
-#STANDARD DECODING WITH M
-device = "cpu"
-ckpt_path = os.path.join("pretrained-medium", 'ckpt.pt')
-checkpoint = torch.load(ckpt_path, map_location=device)
-checkpoint_model_args = checkpoint['model_args']
+# #STANDARD DECODING WITH M
+# device = "cpu"
+# ckpt_path = os.path.join("pretrained-medium", 'ckpt.pt')
+# checkpoint = torch.load(ckpt_path, map_location=device)
+# checkpoint_model_args = checkpoint['model_args']
 
-gptconf = GPTConfig(**checkpoint['model_args'])
-model = GPT(gptconf)
-model.to(device)
-state_dict = checkpoint['model']
-modelCopy = model
+# gptconf = GPTConfig(**checkpoint['model_args'])
+# model = GPT(gptconf)
+# model.to(device)
+# state_dict = checkpoint['model']
+# modelCopy = model
 
-unwanted_prefix = '_orig_mod.'
+# unwanted_prefix = '_orig_mod.'
 
-for k,v in list(state_dict.items()):
-        if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+# for k,v in list(state_dict.items()):
+#         if k.startswith(unwanted_prefix):
+#             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
 
-model.load_state_dict(state_dict)
+# model.load_state_dict(state_dict)
 
-print("STANDARD DECODING WITH M")
-with torch.no_grad():
-    with ctx:
-        for k in range(num_samples):
-            #y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
-            y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k, isQuantize=False)
-            print(decode(y[0].tolist()))
-            print('---------------')
+# print("STANDARD DECODING WITH M")
+# with torch.no_grad():
+#     with ctx:
+#         for k in range(num_samples):
+#             #y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
+#             y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k, isQuantize=False)
+#             print(decode(y[0].tolist()))
+#             print('---------------')
 
-#SPEC DECODING WHERE D IS THE DRAFT MODEL, D = GPT2
+# #SPEC DECODING WHERE D IS THE DRAFT MODEL, D = GPT2
 
-print('Loading draft model')
-draft_model = GPT.from_pretrained('gpt2', dict(dropout=0.0))
-"""
-draft_model.eval()
-draft_model.to(device) """
+# print('Loading draft model')
+# draft_model = GPT.from_pretrained('gpt2', dict(dropout=0.0))
+# """
+# draft_model.eval()
+# draft_model.to(device) """
 
-generations_spec = []
-with torch.no_grad():
-    with ctx:
-        for k in range(num_samples):
-            torch.manual_seed(k+1337) # we want consistency
-            y = model.generate_speculative(x, max_new_tokens, draft_model, temperature=temperature, top_k=top_k)
-            generations_spec.append(y[0].tolist())
-            print(decode(generations_spec[-1]))
-            print('---------------')
+# generations_spec = []
+# with torch.no_grad():
+#     with ctx:
+#         for k in range(num_samples):
+#             torch.manual_seed(k+1337) # we want consistency
+#             y = model.generate_speculative(x, max_new_tokens, draft_model, temperature=temperature, top_k=top_k)
+#             generations_spec.append(y[0].tolist())
+#             print(decode(generations_spec[-1]))
+#             print('---------------')
 
-#quantize M now part 4
+# #quantize M now part 4
 
-def quantize_param(param): #this data is the param data
+# def quantize_param(param): #this data is the param data
     
-    abs_max = torch.max(torch.abs(param))
-    scaled_tensor = param / abs_max
-    scaled_tensor = (scaled_tensor * 127.)
+#     abs_max = torch.max(torch.abs(param))
+#     scaled_tensor = param / abs_max
+#     scaled_tensor = (scaled_tensor * 127.)
 
-    clipped_tensor = torch.clamp(scaled_tensor, -127., 127.)
-    quantized_tensor = clipped_tensor.to(torch.int8)
-    quantized_tensor = quantized_tensor.to(torch.int8)
-    return quantized_tensor, abs_max
+#     clipped_tensor = torch.clamp(scaled_tensor, -127., 127.)
+#     quantized_tensor = clipped_tensor.to(torch.int8)
+#     quantized_tensor = quantized_tensor.to(torch.int8)
+#     return quantized_tensor, abs_max
     
 
-def dequantize_param(param, maxval):
-    """ rangemax = 127
-    dequantized_tensor = param.to(torch.float16)
-    dequantized_tensor = dequantized_tensor / rangemax * maxval
-    return dequantized_tensor """
+# def dequantize_param(param, maxval):
+#     """ rangemax = 127
+#     dequantized_tensor = param.to(torch.float16)
+#     dequantized_tensor = dequantized_tensor / rangemax * maxval
+#     return dequantized_tensor """
 
-    rangemax = 127
-    dequantized_tensor = param.to(torch.float32)
-    dequantized_tensor = dequantized_tensor / rangemax * maxval
-    dequantized_tensor = dequantized_tensor.to(torch.float32)
-    return dequantized_tensor
+#     rangemax = 127
+#     dequantized_tensor = param.to(torch.float32)
+#     dequantized_tensor = dequantized_tensor / rangemax * maxval
+#     dequantized_tensor = dequantized_tensor.to(torch.float32)
+#     return dequantized_tensor
 
-print("quantizing the model parameters")
-max_vals = {} #this is a dictionary that maps the name of the parameter to the max value of that parameter
-print("param names")
-for name, param in model.named_parameters():
-    if ".wte." in name or ".wpe." in name or "weight" in name or "bias" in name:
-        quantized_tensor, maxval = quantize_param(param.data)
-        #print(name + "_maxval")
-        max_vals[name+"_maxval"] = maxval
-        #assign the quantized tensor back to the model parameter
-        #print(f"data before assigning to state dict =  {state_dict[name].dtype}")
-        param.requires_grad = False
-        #param.dtype = torch.int8
-        state_dict[name] = state_dict[name].to(torch.int8)
-        param.data = quantized_tensor
-        state_dict[name].copy_(param)
-        #print(f"data type after assigning to state dict: {state_dict[name].dtype}")
-        #print(f"data type after assigning to state dict: {param.dtype}")
-        #setattr(name + "_maxval", maxval)
+# print("quantizing the model parameters")
+# max_vals = {} #this is a dictionary that maps the name of the parameter to the max value of that parameter
+# print("param names")
+# for name, param in model.named_parameters():
+#     if ".wte." in name or ".wpe." in name or "weight" in name or "bias" in name:
+#         quantized_tensor, maxval = quantize_param(param.data)
+#         #print(name + "_maxval")
+#         max_vals[name+"_maxval"] = maxval
+#         #assign the quantized tensor back to the model parameter
+#         #print(f"data before assigning to state dict =  {state_dict[name].dtype}")
+#         param.requires_grad = False
+#         #param.dtype = torch.int8
+#         state_dict[name] = state_dict[name].to(torch.int8)
+#         param.data = quantized_tensor
+#         state_dict[name].copy_(param)
+#         #print(f"data type after assigning to state dict: {state_dict[name].dtype}")
+#         #print(f"data type after assigning to state dict: {param.dtype}")
+#         #setattr(name + "_maxval", maxval)
 
-print("at this model M, which is main model is now quantized")
-generations_spec_quant = []
-with torch.no_grad():
-    with ctx:
-        for k in range(num_samples):
-            torch.manual_seed(k+1337) # we want consistency
-            y = modelCopy.generate_speculative(x, max_new_tokens, model, temperature=temperature, top_k=top_k, max_vals=max_vals)
-            generations_spec_quant.append(y[0].tolist())
-            print(decode(generations_spec_quant[-1]))
-            print('---------------')
+# print("at this model M, which is main model is now quantized")
+# generations_spec_quant = []
+# with torch.no_grad():
+#     with ctx:
+#         for k in range(num_samples):
+#             torch.manual_seed(k+1337) # we want consistency
+#             y = modelCopy.generate_speculative(x, max_new_tokens, model, temperature=temperature, top_k=top_k, max_vals=max_vals, isMainModelQuantize=False, isDraftModelQuantize=True)
+#             generations_spec_quant.append(y[0].tolist())
+#             print(decode(generations_spec_quant[-1]))
+#             print('---------------')

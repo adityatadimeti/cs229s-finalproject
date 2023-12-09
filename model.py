@@ -17,56 +17,40 @@ from torch.nn import functional as F
 
 
 def quantize_param(param): #this data is the param data
-    """ rangemin = -128
+    rangemin = -128
     rangemax = 127
-
+    
     maxval = torch.max(torch.abs(param))
-
-    #scaled tensor
     scaling_factor = rangemax / maxval
     scaled_tensor = param * scaling_factor
 
     clipped_tensor = torch.clamp(scaled_tensor, rangemin, rangemax)
-    quantized_tensor = torch.round(clipped_tensor)
-    quantized_tensor = quantized_tensor.to(torch.int8)
-    quantized_tensor.requires_grad = False
-    return quantized_tensor, maxval """
-
-    abs_max = torch.max(torch.abs(param))
-    scaled_tensor = param / abs_max
-    scaled_tensor = (scaled_tensor * 127.)
-
-    clipped_tensor = torch.clamp(scaled_tensor, -127., 127.)
     quantized_tensor = clipped_tensor.to(torch.int8)
-    quantized_tensor = quantized_tensor.to(torch.int8)
-    return quantized_tensor, abs_max
+    quantized_tensor.requires_grad = False
+    return quantized_tensor, maxval
     
 
 def dequantize_param(param, maxval):
     rangemax = 127
-    dequantized_tensor = param.to(torch.float32)
-    dequantized_tensor = dequantized_tensor / rangemax * maxval
+    dequantized_tensor = param / rangemax * maxval
     dequantized_tensor = dequantized_tensor.to(torch.float32)
     return dequantized_tensor
 
-def dequantize_module(module, self, paramname, max_vals, prevHierarchy):
+#this wrapper will call the dequantize function and also change the state of the model
+def dequantize_wrapper(module, self, paramname, max_vals, prevHierarchy):
     #module is the actual param data
-    
     if(prevHierarchy != ""):
         fullname = prevHierarchy +"." + paramname
     else:
         fullname = paramname
-    quantized_param = module.detach().clone()
-
+    quantized_param = module
     #print("MODULE DTYPE " + str(module.dtype))
     dequantized_module = dequantize_param(module, max_vals[fullname + "_maxval"])
     self.state_dict()[paramname] = self.state_dict()[paramname].to(torch.float32)
     module.data = dequantized_module
     self.state_dict()[paramname].copy_(dequantized_module)
 
-    return quantized_param
-
-def quantize_module(module, quantdata, self, paramname):
+def save_to_state(module, quantdata, self, paramname):
     self.state_dict()[paramname] = self.state_dict()[paramname].to(torch.int8)
     module.data = quantdata
     self.state_dict()[paramname].copy_(module)
@@ -170,12 +154,14 @@ class CausalSelfAttention(nn.Module):
     def forward_quantize(self, x, max_vals, prevHierarchy):
         B, T, C = x.size()
 
-        quantize_weight = dequantize_module(self.c_attn.weight, self, "c_attn.weight", max_vals, prevHierarchy)
-        quantize_bias = dequantize_module(self.c_attn.bias, self, "c_attn.bias", max_vals, prevHierarchy)
+        og_weight = self.c_attn.weight
+        dequantize_wrapper(self.c_attn.weight, self, "c_attn.weight", max_vals, prevHierarchy)
+        og_bias = self.c_attn.bias
+        dequantize_wrapper(self.c_attn.bias, self, "c_attn.bias", max_vals, prevHierarchy)
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
         #quantize it back
-        quantize_module(self.c_attn.weight, quantize_weight, self, "c_attn.weight")
-        quantize_module(self.c_attn.bias, quantize_bias, self, "c_attn.bias")
+        save_to_state(self.c_attn.weight, og_weight, self, "c_attn.weight")
+        save_to_state(self.c_attn.bias, og_bias, self, "c_attn.bias")
 
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
@@ -194,13 +180,15 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         #similarly need to dequantize first
-        quantize_weight = dequantize_module(self.c_proj.weight, self, "c_proj.weight", max_vals, prevHierarchy)
-        quantize_bias = dequantize_module(self.c_proj.bias, self, "c_proj.bias", max_vals, prevHierarchy)
+        og_weight = self.c_proj.weight
+        dequantize_wrapper(self.c_proj.weight, self, "c_proj.weight", max_vals, prevHierarchy)
+        og_bias = self.c_proj.bias
+        dequantize_wrapper(self.c_proj.bias, self, "c_proj.bias", max_vals, prevHierarchy)
         y = self.resid_dropout(self.c_proj(y))
         #quantize it back
         # output projection
-        quantize_module(self.c_proj.weight, quantize_weight, self, "c_proj.weight")
-        quantize_module(self.c_proj.bias, quantize_bias, self, "c_proj.bias")
+        save_to_state(self.c_proj.weight, og_weight, self, "c_proj.weight")
+        save_to_state(self.c_proj.bias, og_bias, self, "c_proj.bias")
 
         return y
 
@@ -221,21 +209,25 @@ class MLP(nn.Module):
         return x
     
     def forward_quantize(self, x, max_vals, prevHierarchy):
-        quantize_weight = dequantize_module(self.c_fc.weight, self, "c_fc.weight", max_vals, prevHierarchy)
-        quantize_bias = dequantize_module(self.c_fc.bias, self, "c_fc.bias", max_vals, prevHierarchy)
+        og_weight = self.c_fc.weight
+        dequantize_wrapper(self.c_fc.weight, self, "c_fc.weight", max_vals, prevHierarchy)
+        og_bias = self.c_fc.bias
+        dequantize_wrapper(self.c_fc.bias, self, "c_fc.bias", max_vals, prevHierarchy)
         x = self.c_fc(x)
         #quantize it back
-        quantize_module(self.c_fc.weight, quantize_weight, self, "c_fc.weight")
-        quantize_module(self.c_fc.bias, quantize_bias, self, "c_fc.bias")
+        save_to_state(self.c_fc.weight, og_weight, self, "c_fc.weight")
+        save_to_state(self.c_fc.bias, og_bias, self, "c_fc.bias")
 
         x = self.gelu(x)
 
-        quantize_weight = dequantize_module(self.c_proj.weight, self, "c_proj.weight", max_vals, prevHierarchy)
-        quantize_bias = dequantize_module(self.c_proj.bias, self, "c_proj.bias", max_vals, prevHierarchy)
+        og_weight = self.c_proj.weight
+        dequantize_wrapper(self.c_proj.weight, self, "c_proj.weight", max_vals, prevHierarchy)
+        og_bias = self.c_proj.bias
+        dequantize_wrapper(self.c_proj.bias, self, "c_proj.bias", max_vals, prevHierarchy)
         x = self.c_proj(x)
         #quantize it back
-        quantize_module(self.c_proj.weight, quantize_weight, self, "c_proj.weight")
-        quantize_module(self.c_proj.bias, quantize_bias, self, "c_proj.bias")
+        save_to_state(self.c_proj.weight, og_weight, self, "c_proj.weight")
+        save_to_state(self.c_proj.bias, og_bias, self, "c_proj.bias")
 
         x = self.dropout(x)
         return x
@@ -356,16 +348,18 @@ class GPT(nn.Module):
         pos = torch.arange(0, t, dtype=torch.long, device=device)
 
         # forward the GPT model itself
-        quantize_weight = dequantize_module(self.transformer.wte.weight, self, "transformer.wte.weight", max_vals, "")
+        og_weight = self.transformer.wte.weight
+        dequantize_wrapper(self.transformer.wte.weight, self, "transformer.wte.weight", max_vals, "")
         tok_emb = self.transformer.wte(idx)
         #quantize it back
-        quantize_module(self.transformer.wte.weight, quantize_weight, self, "transformer.wte.weight")
+        save_to_state(self.transformer.wte.weight, og_weight, self, "transformer.wte.weight")
 
         #same for pos_emb
-        quantize_weight = dequantize_module(self.transformer.wpe.weight, self, "transformer.wpe.weight", max_vals, "")
+        og_weight = self.transformer.wpe.weight
+        dequantize_wrapper(self.transformer.wpe.weight, self, "transformer.wpe.weight", max_vals, "")
         pos_emb = self.transformer.wpe(pos)
         #quantize it back
-        quantize_module(self.transformer.wpe.weight, quantize_weight, self, "transformer.wpe.weight")
+        save_to_state(self.transformer.wpe.weight, og_weight, self, "transformer.wpe.weight")
 
         x = self.transformer.drop(tok_emb + pos_emb)
         indexcount = 0
@@ -374,7 +368,8 @@ class GPT(nn.Module):
             indexcount+=1
         x = self.transformer.ln_f.forward_quantize(x, max_vals, "transformer.ln_f")
 
-        quantized_weight = dequantize_module(self.transformer.wte.weight, self, "transformer.wte.weight", max_vals, "")
+        og_weight = self.transformer.wte.weight
+        dequantize_wrapper(self.transformer.wte.weight, self, "transformer.wte.weight", max_vals, "")
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
@@ -383,32 +378,8 @@ class GPT(nn.Module):
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
-        quantize_module(self.transformer.wte.weight, quantized_weight, self, "transformer.wte.weight")
+        save_to_state(self.transformer.wte.weight, og_weight, self, "transformer.wte.weight")
         return logits, loss
-    
-    """ def quantize(self):
-        for name, param in self.named_parameters():
-            if ".wte." in name or ".wpe." in name or "weight" in name:
-                param, maxval = quantize_param(param)
-                self.state_dict()[name].copy_(param)
-                #setattr(self, name + "_maxval", maxval)
-                max_vals[name+"_maxval"] = maxval
-
-        for index in range(len(self.transformer.h)):
-            self.transformer.h[index].quantize()
-
-        self.transformer.ln_f.quantize()
-
-    def quantize_total(self):
-        for name, param in self.named_parameters():
-            param, maxval = quantize_param(param)
-            self.state_dict()[name].copy_(param)
-            setattr(self, name + "_maxval", maxval)
-    
-    def dequantize_total(self):
-        for name, param in self.named_parameters():
-            param = dequantize_param(param, getattr(self, name + "_maxval"))
-            self.state_dict()[name].copy_(param) """
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -558,7 +529,7 @@ class GPT(nn.Module):
     
     @torch.no_grad()
     
-    def generate_speculative(self, idx, max_new_tokens, draft_model, temperature=1.0, top_k=None, num_speculative=4):
+    def generate_speculative(self, idx, max_new_tokens, draft_model, temperature=1.0, top_k=None, num_speculative=4, isMainModelQuantize=False, isDraftModelQuantize=True):
    
         idx_length_original = idx.size(1)
         
@@ -575,10 +546,16 @@ class GPT(nn.Module):
             ### YOUR CODE HERE
 
             # use the draft_model to generate speculative tokens
-            idx_speculative = draft_model.generate(idx_cond, num_speculative, temperature=temperature, top_k=1)
-
+            if(isDraftModelQuantize):
+                idx_speculative = draft_model.generate(idx_cond, num_speculative, temperature=temperature, top_k=1, isQuantize=True)
+            else:
+                idx_speculative = draft_model.generate(idx_cond, num_speculative, temperature=temperature, top_k=1)
+            
             # obtain the logits from the main model by passing in the idx_speculative
-            all_logits, _ = self(idx_speculative)
+            if(isMainModelQuantize):
+                all_logits, _ = self.forward_quantize(idx_speculative)
+            else:
+                all_logits, _ = self(idx_speculative)
             
             ### END YOUR CODE HERE
 
@@ -619,64 +596,64 @@ class GPT(nn.Module):
             print(f"speculative decoding ran for {loop_counter} iterations")
         return idx[:,:idx_length_original+max_new_tokens]
     
-    @torch.no_grad()
-    #this assumes that the draft model is quantized
-    def generate_speculative_with_quant(self, idx, max_new_tokens, draft_model, temperature=1.0, top_k=None, num_speculative=4, max_vals=None):
+    # @torch.no_grad()
+    # #this assumes that the draft model is quantized
+    # def generate_speculative_with_quant(self, idx, max_new_tokens, draft_model, temperature=1.0, top_k=None, num_speculative=4, max_vals=None):
    
-        idx_length_original = idx.size(1)
+    #     idx_length_original = idx.size(1)
         
-        loop_counter = 0
-        while idx.size(1) < idx_length_original+max_new_tokens:
-            loop_counter += 1
+    #     loop_counter = 0
+    #     while idx.size(1) < idx_length_original+max_new_tokens:
+    #         loop_counter += 1
 
-            # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx if idx.size(1) <= self.config.block_size -num_speculative else idx[:, -self.config.block_size -num_speculative:]
+    #         # if the sequence context is growing too long we must crop it at block_size
+    #         idx_cond = idx if idx.size(1) <= self.config.block_size -num_speculative else idx[:, -self.config.block_size -num_speculative:]
 
-            # Generate speculative tokens from the draft model. Then, run it through the main model.
-            # Be sure to set top_k=1, otherwise you'll pollute the RNG! (Which will make your code harder to debug.)
+    #         # Generate speculative tokens from the draft model. Then, run it through the main model.
+    #         # Be sure to set top_k=1, otherwise you'll pollute the RNG! (Which will make your code harder to debug.)
 
-            ### YOUR CODE HERE
+    #         ### YOUR CODE HERE
 
-            # use the draft_model to generate speculative tokens
-            idx_speculative = draft_model.generate(idx_cond, num_speculative, temperature=temperature, top_k=1, isQuant=True, max_vals=max_vals)
+    #         # use the draft_model to generate speculative tokens
+    #         idx_speculative = draft_model.generate(idx_cond, num_speculative, temperature=temperature, top_k=1, isQuant=True, max_vals=max_vals)
 
-            # obtain the logits from the main model by passing in the idx_speculative
-            all_logits, _ = self.forward_quantize(idx_speculative, max_vals=max_vals)
+    #         # obtain the logits from the main model by passing in the idx_speculative
+    #         all_logits, _ = self.forward_quantize(idx_speculative, max_vals=max_vals)
             
-            ### END YOUR CODE HERE
+    #         ### END YOUR CODE HERE
 
-            # Step through the predictions of the main model, sampling, and check whether they match the next token. Stop upon mismatch.
+    #         # Step through the predictions of the main model, sampling, and check whether they match the next token. Stop upon mismatch.
 
-            ### YOUR CODE HERE
+    #         ### YOUR CODE HERE
 
-            # iterate from the end position of idx_cond (prefix sequence) to the end position of idx_speculative (generated sequence)
+    #         # iterate from the end position of idx_cond (prefix sequence) to the end position of idx_speculative (generated sequence)
             
-            for i in range(idx_cond.size(1)-1, idx_speculative.size(1)-1):
+    #         for i in range(idx_cond.size(1)-1, idx_speculative.size(1)-1):
 
-                # pluck the logits at the current position and scale by desired temperature
-                logits = all_logits[:, i, :] / temperature
+    #             # pluck the logits at the current position and scale by desired temperature
+    #             logits = all_logits[:, i, :] / temperature
 
-                # optionally crop the logits to only the top k options
-                if top_k is not None:
-                    if top_k == 1:
-                        pass
-                    else:
-                        v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                        logits[logits < v[:, [-1]]] = -float('Inf')
+    #             # optionally crop the logits to only the top k options
+    #             if top_k is not None:
+    #                 if top_k == 1:
+    #                     pass
+    #                 else:
+    #                     v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+    #                     logits[logits < v[:, [-1]]] = -float('Inf')
 
-                # apply softmax to convert logits to (normalized) probabilities
-                probs = F.softmax(logits, dim=-1)
+    #             # apply softmax to convert logits to (normalized) probabilities
+    #             probs = F.softmax(logits, dim=-1)
 
-                # sample from the distribution with temperature
-                idx_next = torch.multinomial(probs, num_samples=1)
+    #             # sample from the distribution with temperature
+    #             idx_next = torch.multinomial(probs, num_samples=1)
 
-                # append sampled index to the running sequence and continue
-                idx = torch.cat((idx, idx_next), dim=1)
+    #             # append sampled index to the running sequence and continue
+    #             idx = torch.cat((idx, idx_next), dim=1)
 
-                # end the loop if the next token does not match the next token in idx_speculative
-                if idx_next != idx_speculative[:, i+1]:
-                    break
+    #             # end the loop if the next token does not match the next token in idx_speculative
+    #             if idx_next != idx_speculative[:, i+1]:
+    #                 break
 
-            ### END YOUR CODE HERE
-            print(f"speculative decoding with draft as quantized ran for {loop_counter} iterations")
-        return idx[:,:idx_length_original+max_new_tokens]
+    #         ### END YOUR CODE HERE
+    #         print(f"speculative decoding with draft as quantized ran for {loop_counter} iterations")
+    #     return idx[:,:idx_length_original+max_new_tokens]
