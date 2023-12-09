@@ -192,7 +192,7 @@ class CausalSelfAttention(nn.Module):
 
         return y
 
-class MLP(nn.Module):
+class MLP(nn.Module): # somehow only do the pruning step after 100 iterations. keep track of some global variable / flag???
 
     def __init__(self, config):
         super().__init__()
@@ -202,7 +202,36 @@ class MLP(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        x = self.c_fc(x)
+        
+        # Right before this line: prune the Nxd to be Nx(0.1d). Prune the dx4d to be (0.1d) x 4d
+        # To prune the Nxd to be Nx(0.1d), we have to identify the corresponding columns that must be pruned.
+        # We do this by looking at the weight matrix, which is dx4d, and prune the 0.9d rows with lowest L2 norm.
+
+        # IMPORTANT POINT: in the forward c_fc function, the weight matrix is TRANSPOSED. This means that initially, the weight matrix is 4d x d. 
+
+        c_fc_col_indices = None
+        for name, param in self.named_parameters():
+            if name == "c_fc.weight":
+                # Print the row norms of the weight matrix
+                WT = param # this is 4d x d
+                W = WT.transpose(0,1)  # this is d x 4d
+                row_norms = torch.norm(W, dim=1) 
+
+                largest_row_norms_indices = torch.topk(row_norms, int(0.1*W.size(0)), largest=True, sorted=False)
+                
+                c_fc_col_indices = largest_row_norms_indices.indices
+
+                W_pruned = torch.index_select(W, 0, largest_row_norms_indices.indices)
+                WT_pruned = W_pruned.transpose(0,1)
+
+                param.data = WT_pruned
+                break
+
+        # Now, we must select the corresponding columsn in the input matrix x to be pruned.
+
+        x = self.c_fc(torch.index_select(x, 2, c_fc_col_indices)) # first linear layer. input is matrix of size Nxd where N is batch size and d is embedding dimension. 
+                                                                  # Weights are matrix of size dx4d. Output is matrix of size Nx4d. Mat mul of Nxd * dx4d = Nx4d
+                         
         x = self.gelu(x)
         x = self.c_proj(x)
         x = self.dropout(x)
