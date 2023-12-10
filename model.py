@@ -192,6 +192,24 @@ class CausalSelfAttention(nn.Module):
 
         return y
 
+class PrunableLinear(nn.Linear):
+    def __init__(self, in_features, out_features, bias=True):
+        super(PrunableLinear, self).__init__(in_features, out_features, bias)
+        self.pruned = False
+
+    def prune(self, pruning_ratio):
+        with torch.no_grad():
+            # Prune based on the L2 norm of the rows
+            row_norms = torch.norm(self.weight, dim=1)
+            num_rows_to_keep = int((1 - pruning_ratio) * self.weight.size(0))
+            top_indices = torch.topk(row_norms, num_rows_to_keep, largest=True).indices
+            
+            self.weight = nn.Parameter(torch.index_select(self.weight, 0, top_indices))
+            if self.bias is not None:
+                self.bias = nn.Parameter(torch.index_select(self.bias, 0, top_indices))
+            self.pruned = True
+
+
 class MLP(nn.Module): # somehow only do the pruning step after 100 iterations. keep track of some global variable / flag???
 
     def __init__(self, config):
@@ -205,6 +223,12 @@ class MLP(nn.Module): # somehow only do the pruning step after 100 iterations. k
         self.pruneFlag = False
         self.pruned = False
 
+        self.d = config.n_embd
+        self.fourD = 4 * config.n_embd
+
+        self.fc_input_size = config.n_embd # this is d
+        self.bias = config.bias
+
     def forward(self, x):
         
         # Right before this line: prune the Nxd to be Nx(0.1d). Prune the dx4d to be (0.1d) x 4d
@@ -214,14 +238,13 @@ class MLP(nn.Module): # somehow only do the pruning step after 100 iterations. k
         # IMPORTANT POINT: in the forward c_fc function, the weight matrix is TRANSPOSED. This means that initially, the weight matrix is 4d x d. 
         # print(self.pruneFlag)
 
-        print("forward pass", "pruneFlag " + str(self.pruneFlag), "pruned " + str(self.pruned))
+        #print("forward pass", "pruneFlag " + str(self.pruneFlag), "pruned " + str(self.pruned))
         if self.pruneFlag:
             for name, param in self.named_parameters():
-                print(param.shape)
                 if name == "c_fc.weight":
                     # Print the row norms of the weight matrix
                     WT = param # this is 4d x d
-                    W = WT.transpose(0,1)  # this is d x 4d
+                    W = WT.transpose(0, 1)  # this is d x 4d
                     row_norms = torch.norm(W, dim=1) 
 
                     largest_row_norms_indices = torch.topk(row_norms, int(0.1*W.size(0)), largest=True, sorted=False)
@@ -238,7 +261,8 @@ class MLP(nn.Module): # somehow only do the pruning step after 100 iterations. k
 
             x = self.c_fc(torch.index_select(x, 2, self.c_fc_prune_indices)) # first linear layer. input is matrix of size Nxd where N is batch size and d is embedding dimension. 
                                                                     # Weights are matrix of size dx4d. Output is matrix of size Nx4d. Mat mul of Nxd * dx4d = Nx4d
-
+            
+            self.c_fc = nn.Linear(W_pruned.size(0), 4 * self.d, bias=self.bias) # change the linear layer to be 0.1d x 4d
             x = self.gelu(x)
 
             
@@ -253,22 +277,19 @@ class MLP(nn.Module): # somehow only do the pruning step after 100 iterations. k
                     largest_row_norms_indices = torch.topk(row_norms, int(0.1*W.size(0)), largest=True, sorted=False)
 
                     self.c_proj_prune_indices = largest_row_norms_indices.indices
- 
+
                     W_pruned = torch.index_select(W, 0, largest_row_norms_indices.indices) # (0.1 * 4d) x d
-
                     WT_pruned = W_pruned.transpose(0,1)
-
-
                     param.data = WT_pruned
                     break
             
             x = self.c_proj(torch.index_select(x, 2, self.c_proj_prune_indices)) # second linear layer. input is matrix of size Nx4d where N is batch size and d is embedding dimension.
                                                                         # We prune to get N x (0.1 * 4)d * (0.1 * 4)d x d = Nxd
             x = self.dropout(x)
+            self.c_proj = nn.Linear(int(self.fourD / 10), self.fc_input_size, bias=self.bias) # (0.1 * 4)d
 
             self.pruneFlag = False
             self.pruned = True
-
 
         elif self.pruned:
             x = self.c_fc(torch.index_select(x, 2, self.c_fc_prune_indices))
