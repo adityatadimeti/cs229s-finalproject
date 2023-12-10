@@ -77,11 +77,17 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = False # use PyTorch 2.0 to compile the model to be faster
+prune_at = -1
+prune_type = "None"
+prune_percentile = 0.9
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
+
+if prune_type not "None"
+    out_dir = out_dir + "_" + prune_type + "_" + str(prune_at)
 
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
@@ -261,22 +267,23 @@ running_mfu = -1.0
 
 
 """
-overall: take top 10% of weights ACROSS ALL parameters, not just individual parameters. certain parameters are weights and certain ones are biases. 
+overall: take top 10% of weights ACROSS ALL parameters, not just individual parameters. certain parameters are weights and certain ones are biases.
 Step by step:
 1 - identify parameters that are weight parameters
 2 - coalesce all the weight parameters via flatten, which puts them into a single list
 3 - reverse - sort them and identify the weight value that's at the 10% mark
-4 - then you develop a mask, per weight parameter (i.e. for each parameter thats a weight), 
-    that is 1 if the weight is above the 10% mark, and 0 if it's below the 10% mark. 
-    note that this mask is fixed for each weight parameter, so the mask never changes. 
+4 - then you develop a mask, per weight parameter (i.e. for each parameter thats a weight),
+    that is 1 if the weight is above the 10% mark, and 0 if it's below the 10% mark.
+    note that this mask is fixed for each weight parameter, so the mask never changes.
 5 - you repeatedly multiply this mask with the weight parameter since there are occasisins where the weight
-    parameter is 0 and then becomes nonzero because it gets learned. we want to prevent this. 
+    parameter is 0 and then becomes nonzero because it gets learned. we want to prevent this.
 """
 
-mask_dict = {} # moving this outside while training loop so mask_dict is not reinitlized for each iteration
-for name, param in model.named_parameters():
-    mask_dict[name] = torch.ones_like(param) # note that we can use name as a key because each name is unique per layer/type
-    #print(name, mask_dict[name])
+if prune_type == "zero_indiv" or prune_type == "zero_row":
+    mask_dict = {} # moving this outside while training loop so mask_dict is not reinitlized for each iteration
+    for name, param in model.named_parameters():
+        mask_dict[name] = torch.ones_like(param.data) # note that we can use name as a key because each name is unique per layer/type
+        #print(name, mask_dict[name])
 
 # Calculate the percentage of data values across all entries of all weight matrices across all parameters that equal 0
 # total_values = 0
@@ -290,21 +297,99 @@ for name, param in model.named_parameters():
 # percent_zero_values = (zero_values / total_values) * 100
 #print("Percentage of weight values that equal 0:", percent_zero_values)
 
-file_path = 'prune_data_'+str(eval_iters)+'_'+str(batch_size)+'.pickle'
 
 
 while True:
-   
+
     print("INSIDE ITERATION " , iter_num)
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
-    
+<<<<<<< HEAD
+
+    # Check prune approach
+    if (prune_type == "zero_indiv"):
+        # Check to load prune info
+        file_path_mask = 'prune_data_indiv_'+str(eval_iters)+'_'+str(batch_size)+'.pickle'
+        if (iter_num == prune_at):
+            print("time to prune zeroing indivs")
+            fn = file_path_mask
+            if os.path.isfile(fn):
+                print("pckle file exists")
+                with open(fn, 'rb') as f:
+                    prune_val = pickle.load(f)
+                    iter_num = pickle.load(f)
+                    mask_dict = pickle.load(f)
+                    batch_size = pickle.load(f)
+
+                    for name, param in model.named_parameters():
+                        if "weight" in name:
+                            mask_dict[name][torch.abs(param.data) < prune_val] = 0
+                            print(name, mask_dict[name])
+                            with torch.no_grad(): # freezes the grad for the entire matrix??? or just the mask?
+                                param *= mask_dict[name]
+
+            else:
+                print("no pickle file, running prune data process")
+                layer_weights_count = 0
+                flattened_tensors = []
+                # Count weights, flatten
+                for name, param in model.named_parameters():
+                    if 'weight' in name:
+                        flattened_tensors.append(param.data.flatten())
+                        layer_weights_count += param.data.flatten().numel()
+                print("Checked on weights: ", layer_weights_count)
+                flattened_weights = torch.cat(flattened_tensors)
+
+                # Calculate 90th percentile weight
+                sorted_indices = torch.argsort(torch.abs(flattened_weights), descending=True)
+                sorted_flattened_weights = flattened_weights[sorted_indices]
+                threshold_index = int(layer_weights_count * (1 - prune_percentile))
+                prune_val = abs(sorted_flattened_weights[threshold_index])
+
+                # flatten_parameters = lambda: [param.data.flatten() for name, param in model.named_parameters() if "weight" in name]
+
+                # # flatten the parameters and sort them by their magnitudes
+                # flattened_parameters = flatten_parameters() # this is a list of tensors
+                # flattened_and_concatenated = [tensor.tolist() for tensor in flattened_parameters]
+                # flattened_and_concatenated = [item for sublist in flattened_and_concatenated for item in sublist]
+                # sorted_list = sorted(flattened_and_concatenated, key=abs, reverse=True)
+
+                # find the index to prune up to
+                # prune_index = int(len(sorted_list) * 0.1)
+                # prune_val = sorted_list[prune_index]
+                print("done with evaluations, starting to save")
+
+                # Save this pruning data to the pickle file
+                with open(file_path_mask, 'wb') as f:
+                    pickle.dump(prune_val, f)
+                    pickle.dump(iter_num, f)
+                    #pickle.dump(flattened_parameters, f)
+                    #pickle.dump(sorted_list, f)
+                    pickle.dump(mask_dict, f)
+                    pickle.dump(batch_size, f)
+                print("saved")
+
+                # Zero weights below 90th percentile
+                # Freeze gradient on product
+                for name, param in model.named_parameters():
+                    if "weight" in name:
+                        mask_dict[name][torch.abs(param.data) < prune_val] = 0
+                        with torch.no_grad(): # freezes the grad for the entire matrix??? or just the mask?
+                            param *= mask_dict[name]
+        else:
+            # Keep zero-ed weights zero-ed
+            for name, param in model.named_parameters():
+                if "weight" in name:
+                    with torch.no_grad(): # freezes the grad for the entire matrix??? or just the mask?
+                        param *= mask_dict[name]
+=======
+
     if (iter_num == 1):
         for block in model.transformer.h:
             block.mlp.pruneFlag = True  # Set to True to enable pruning ???
-            block.mlp.pruned = False 
+            block.mlp.pruned = False
     # if (iter_num == 100):
     #     print("time to prune")
     #     # create a lambda function that flattens all parameters that have "weight" in name
@@ -326,7 +411,7 @@ while True:
     #                     print(name, mask_dict[name])
     #                     with torch.no_grad(): # freezes the grad for the entire matrix??? or just the mask?
     #                         param *= mask_dict[name]
-        
+
     #     else:
     #         print("no pickle file, so running manual process")
 
@@ -377,11 +462,103 @@ while True:
     #                 with torch.no_grad(): # freezes the grad for the entire matrix??? or just the mask?
     #                     param *= mask_dict[name]
         # prune_val = 0.4 # hard coding this for debugging purposes
+>>>>>>> efe37a461c0f3d8ceb02f0192f42059f657548f8
 
-        
-        
+    elif (prune_type == "zero_row"):
+        file_path_mask = 'prune_data_row_'+str(eval_iters)+'_'+str(batch_size)+'.pickle'
+        if (iter_num == prune_at):
+            print("time to prune zeroing row-wise")
+            fn = file_path_mask
+            # Check to load prune info
+            if os.path.isfile(fn):
+                print("pckle file exists")
+                with open(fn, 'rb') as f:
+                    prune_val = pickle.load(f)
+                    iter_num = pickle.load(f)
+                    mask_dict = pickle.load(f)
+                    batch_size = pickle.load(f)
+
+                    # Calculate & Set masks/zeros from file data
+                    for name, param in model.named_parameters():
+                        if "weight" in name and param.data.ndim > 1:
+                            row_norms = torch.norm(param.data, p=2, dim=1)
+                            mask_dict[name][row_norms < prune_val, :] = 0
+                            with torch.no_grad(): # freezes the grad for the entire matrix??? or just the mask?
+                                param *= mask_dict[name]
+
+            else:
+                print("no pickle file, so running manual process")
+
+                # Count weights, flatten row-wise norms
+                layer_weights_count = 0
+                flattened_tensors = []
+                for name, param in model.named_parameters():
+                    if 'weight' in name:
+                        # Cannot prune dimensionless
+                        if param.data.ndim > 1:
+                            # Assign each weight, row norm to percentile accurately
+                            row_norms = torch.norm(param.data, p=2, dim=1)
+                            flattened_tensors.append(row_norms.repeat(param.data.shape[1]))
+                        layer_weights_count += param.data.flatten().numel()
+                print("Checked on weights: ", layer_weights_count)
+                # Calculate 90th percentile weight-wise row_norm
+                flattened_weights = torch.cat(flattened_tensors)
+                sorted_indices = torch.argsort(torch.abs(flattened_weights), descending=True)
+                sorted_flattened_weights = flattened_weights[sorted_indices]
+                threshold_index = int(layer_weights_count * (1 - prune_percentile))
+                prune_val = abs(sorted_flattened_weights[threshold_index])
+
+                # flatten_parameters = lambda: [param.data.flatten() for name, param in model.named_parameters() if "weight" in name]
+
+                # # flatten the parameters and sort them by their magnitudes
+                # flattened_parameters = flatten_parameters() # this is a list of tensors
+                # flattened_and_concatenated = [tensor.tolist() for tensor in flattened_parameters]
+                # flattened_and_concatenated = [item for sublist in flattened_and_concatenated for item in sublist]
+                # sorted_list = sorted(flattened_and_concatenated, key=abs, reverse=True)
+
+                # find the index to prune up to
+                # prune_index = int(len(sorted_list) * 0.1)
+                # prune_val = sorted_list[prune_index]
+                print("done with evaluations, starting to save for prune val of ", prune_val)
+
+                # save this prune data to the pickle file
+                with open(file_path_mask, 'wb') as f:
+                    pickle.dump(prune_val, f)
+                    pickle.dump(iter_num, f)
+                    #pickle.dump(flattened_parameters, f)
+                    #pickle.dump(sorted_list, f)
+                    pickle.dump(mask_dict, f)
+                    pickle.dump(batch_size, f)
+                print("saved")
+
+                # Zero rows below 90th percentile
+                for name, param in model.named_parameters():
+                    if "weight" in name and param.data.ndim > 1:
+                        # this is a weight parameter
+                        #print("sum of weights before pruning", torch.sum(torch.abs(param.data)))
+                        row_norms = torch.norm(param.data, p=2, dim=1)
+                        mask_dict[name][row_norms < prune_val, :] = 0
+                        #print(name, mask_dict[name])
+                        with torch.no_grad(): # freezes the grad for the entire matrix??? or just the mask?
+                            param *= mask_dict[name]
+        # prune_val = 0.4 # hard coding this for debugging purposes
         #print(len(sorted_list), prune_val, max(sorted_list), min(sorted_list))
-    
+<<<<<<< HEAD
+        else:
+            # Maintain zero-ed weight rows
+            for name, param in model.named_parameters():
+                if "weight" in name:
+                    with torch.no_grad(): # freezes the grad for the entire matrix??? or just the mask?
+                        param *= mask_dict[name]
+    elif (prune_type == "reduce"):
+        if (iter_num == prune_at):
+            print("Nah")
+            # set model param is_pruning = True for reduction forward call
+        else:
+            print("You didnt do it ")
+            # set model param is_pruning = False for normal forward call
+=======
+
     else:
         for block in model.transformer.h:
             block.mlp.pruneFlag = False  # Set to False to disable pruning ???
@@ -390,21 +567,19 @@ while True:
         #     if "weight" in name:
         #         with torch.no_grad(): # freezes the grad for the entire matrix??? or just the mask?
         #             param *= mask_dict[name]
+>>>>>>> efe37a461c0f3d8ceb02f0192f42059f657548f8
 
-        
 
-    
     # Calculate the percentage of data values across all entries of all weight matrices across all parameters that equal 0
-    # total_values = 0
-    # zero_values = 0
+    total_values = 0
+    zero_values = 0
+    for name, param in raw_model.named_parameters():
+        if "weight" in name:
+            total_values += param.numel()
+            zero_values += (param == 0).sum().item()
 
-    # for name, param in raw_model.named_parameters():
-    #     if "weight" in name:
-    #         total_values += param.numel()
-    #         zero_values += (param == 0).sum().item()
-
-    # percent_zero_values = (zero_values / total_values) * 100
-    # print("Percentage of weight values that equal 0:", percent_zero_values)
+    percent_zero_values = (zero_values / total_values) * 100
+    print("Percentage of weight values that equal 0:", percent_zero_values)
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
@@ -481,4 +656,3 @@ while True:
 
 if ddp:
     destroy_process_group()
-
