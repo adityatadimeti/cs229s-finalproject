@@ -94,6 +94,27 @@ def dequantize_param(param, maxval):
     dequantized_tensor = dequantized_tensor / rangemax * maxval
     return dequantized_tensor
 
+#this is the zero point quantization version that we tested with but didnt find that it performed any better than the absolute max, nor the naive implementation
+# def zero_point_quant(param):
+#     rangemin = -128.
+#     rangemax = 127.
+
+#     max = torch.max(param)
+#     min = torch.min(param)
+    
+#     scale_factor = (rangemax-rangemin) / (max-min)
+#     quantized_tensor = scale_factor * param
+    
+#     #offset to using the zeroopoint
+#     zero_point = (-1 * scale_factor * min) + rangemin
+#     quantized_tensor = quantized_tensor + zero_point
+
+#     quantized_tensor = torch.clamp(quantized_tensor, rangemin, rangemax)
+#     quantized_tensor = torch.round(quantized_tensor)
+#     quantized_tensor = quantized_tensor.to(torch.int8)
+#     return quantized_tensor, scale_factor, zero_point
+
+
 # poor man's data loader
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
@@ -102,6 +123,7 @@ train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mod
 val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
 
 def get_batch(split):
+    print("getting batch " + str(batch_size))
     data = train_data if split == 'train' else val_data
     ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
@@ -114,7 +136,7 @@ def get_batch(split):
     return x, y
 
 @torch.no_grad()
-def estimate_loss(isQuantize=False, max_vals=None):
+def estimate_loss(isQuantize=False, max_vals=None, zerovals=None, scales=None):
     out = {}
     model.eval()
     for split in ['train', 'val']:
@@ -134,7 +156,7 @@ def estimate_loss(isQuantize=False, max_vals=None):
 
 #BEST TO COMMENT OUT EITHER (PART 1 AND 2) OR (PART 3 AND 4) to run the code, best to run the code in two halves
 #PART 1 AND 2 STUFF - CHANGE THE CHECKPOINT TO THE 12 BATCH SIZE TO GET THE OTHER RESULTS 
-""" ckpt_path = os.path.join("pretrainedSmallBatchSize12", 'ckpt.pt') #use either pretrainedSmallBatchSize4 or pretrainedSmallBatchSize12 or pretrainedSmallBatchSize1 or pretrainedMediumBatchSize1 - all of these are 1024 seq len
+ckpt_path = os.path.join("pretrainedSmallBatchSize4", 'ckpt.pt') #use either pretrainedSmallBatchSize4 or pretrainedSmallBatchSize12 or pretrainedSmallBatchSize1 or pretrainedMediumBatchSize1 - all of these are 1024 seq len
 checkpoint = torch.load(ckpt_path, map_location=device)
 checkpoint_model_args = checkpoint['model_args']
 
@@ -151,6 +173,8 @@ for k,v in list(state_dict.items()):
 
 model.load_state_dict(state_dict)
 
+batch_size = 12 #change /toggle this batch size from 4 to 12
+
 print("without quantization loss and perplexity")
 losses = estimate_loss(isQuantize=False)
 print(losses)
@@ -161,12 +185,17 @@ memory_usage = torch.cuda.max_memory_allocated()
 
 print("quantizing the model parameters")
 max_vals = {} #this is a dictionary that maps the name of the parameter to the max value of that parameter
+#zero_vals = {}
+#scales = {}
 mytest = None
 for name, param in model.named_parameters():
     if ".wte." in name or ".wpe." in name or "weight" in name or "bias" in name:
         quantized_tensor, maxval = quantize_param(param.data)
+        #quantized_tensor, scale, zero_point = zero_point_quant(param.data)
         #print(name + "_maxval")
         max_vals[name+"_maxval"] = maxval
+        #zero_vals[name+"_zeroval"] = zero_point
+        #scales[name+"_scale"] = scale
         #assign the quantized tensor back to the model parameter
         #print(f"data before assigning to state dict =  {state_dict[name].dtype}")
         param.requires_grad = False
@@ -187,7 +216,7 @@ print(losses)
 
 perplexity = torch.exp(losses['val'])
 print("perplex val " + str(perplexity))
-print("mem usage" + str(torch.cuda.memory_allocated() )) """
+print("mem usage" + str(torch.cuda.memory_allocated() ))
 
 
 
@@ -203,8 +232,8 @@ print("mem usage" + str(torch.cuda.memory_allocated() )) """
 print("3 and 4 stuff")
 
 # #PART 3 AND 4
-
-print('Loading main model')
+batch_size=1
+""" print('Loading main model')
 ckpt_path = os.path.join("pretrainedMediumBatchSize1", 'ckpt.pt') #this model has already been finetuned, so just load it in
 checkpoint = torch.load(ckpt_path, map_location=device)
 checkpoint_model_args = checkpoint['model_args']
@@ -245,7 +274,7 @@ if start.startswith('FILE:'):
     with open(start[5:], 'r', encoding='utf-8') as f:
         start = f.read()
 start_ids = encode(start)
-x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
+x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...]) """
 
 # max_new_tokens=50
 # print("STANDARD DECODING WITH M")
@@ -302,7 +331,7 @@ print("time completed " + str(timeComplete))
 print("latency " + str(latency)) """
 
 #quantize M now part 4
-print("make M quantized and do standard decoding")
+""" print("make M quantized and do standard decoding")
 print("load model")
 ckpt_path = os.path.join("pretrainedMediumBatchSize1", 'ckpt.pt') #this model has already been finetuned, so just load it in
 checkpoint = torch.load(ckpt_path, map_location=device)
@@ -354,7 +383,7 @@ with torch.no_grad():
 timeComplete = time.time() - t
 latency = timeComplete / num_samples
 print("time completed " + str(timeComplete))
-print("latency " + str(latency))
+print("latency " + str(latency)) """
 
 
 """ print('Loading main model')

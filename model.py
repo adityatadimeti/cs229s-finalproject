@@ -22,19 +22,10 @@ def dequantize_helper(param, maxval):
     dequantized_tensor = dequantized_tensor / rangemax * maxval
     return dequantized_tensor
 
-def quantize_helper(param): #this data is the param data
-    rangemin = -128.
-    rangemax = 127.
-    
-    maxval = torch.max(torch.abs(param))
-    scaled_tensor = param / maxval * rangemax
-
-    quantized_tensor = torch.clamp(scaled_tensor, rangemin, rangemax)
-    quantized_tensor = torch.round(quantized_tensor)
-    quantized_tensor = quantized_tensor.to(torch.int8)
-
-    quantized_tensor.requires_grad = False
-    return quantized_tensor, maxval
+    #this is the zero-point version to dequantize, scales and zeropoint need to be pased in
+    # dequantized_tensor = param.to(torch.float32)
+    # dequantized_tensor = (dequantized_tensor - zero_point) / scale
+    # return dequantized_tensor
 
 def dequantize_and_update(module, self, paramname, max_vals, prevHierarchy):
     #module is the actual param data
@@ -69,11 +60,13 @@ class LayerNorm(nn.Module):
         #dequantize
         #print("before " + str(self.weight.dtype))
         #print("before " + str(self.bias.dtype))
+        ogvals = {}
         for name, param in self.named_parameters():
             #print("PARAM DTYPE " + str(param.dtype))
             fullname = prevHierarchy +"." + name
             dequantized = dequantize_helper(param, max_vals[fullname + "_maxval"])
             self.state_dict()[name] = self.state_dict()[name].to(torch.float32)
+            ogvals[fullname] = param.data.clone()
             param.data = dequantized
             self.state_dict()[name].copy_(param)
             #self.state_dict()[name].copy_(param)
@@ -87,12 +80,13 @@ class LayerNorm(nn.Module):
 
         #re-quantize
         for name, param in self.named_parameters():
-            quantized, maxval = quantize_helper(param)
+            #quantized, maxval = quantize_helper(param)
             fullname = prevHierarchy +"."+ name
             self.state_dict()[name] = self.state_dict()[name].to(torch.int8)
-            param.data = quantized
+            #param.data = quantized
+            param.data = ogvals[fullname]
             self.state_dict()[name].copy_(param)
-            max_vals[fullname+"_maxval"] = maxval
+            #max_vals[fullname+"_maxval"] = maxval
             #setattr(self, name + "_maxval", maxval)
         #print("final state " + str(self.weight.dtype))
         #print("final state " + str(self.bias.dtype))
