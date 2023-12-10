@@ -233,7 +233,31 @@ class MLP(nn.Module): # somehow only do the pruning step after 100 iterations. k
                                                                   # Weights are matrix of size dx4d. Output is matrix of size Nx4d. Mat mul of Nxd * dx4d = Nx4d
                          
         x = self.gelu(x)
-        x = self.c_proj(x)
+
+        #print(x.shape) # Nx4d
+        c_proj_row_indices = None
+        for name, param in self.named_parameters():
+            if name == "c_proj.weight":
+                # Print the row norms of the weight matrix
+                WT = param
+                W = WT.transpose(0,1) # 4d x d
+
+                row_norms = torch.norm(W, dim=1)
+
+                largest_row_norms_indices = torch.topk(row_norms, int(0.1*W.size(0)), largest=True, sorted=False)
+
+                c_proj_row_indices = largest_row_norms_indices.indices
+
+                W_pruned = torch.index_select(W, 0, largest_row_norms_indices.indices) # (0.1 * 4d) x d
+
+                WT_pruned = W_pruned.transpose(0,1)
+
+
+                param.data = WT_pruned
+                break
+        
+        x = self.c_proj(torch.index_select(x, 2, c_proj_row_indices)) # second linear layer. input is matrix of size Nx4d where N is batch size and d is embedding dimension.
+                                                                      # We prune to get N x (0.1 * 4)d * (0.1 * 4)d x d = Nxd
         x = self.dropout(x)
         return x
     
