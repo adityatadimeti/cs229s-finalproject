@@ -200,6 +200,10 @@ class MLP(nn.Module): # somehow only do the pruning step after 100 iterations. k
         self.gelu    = nn.GELU()
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
+        self.c_fc_prune_indices = None
+        self.c_proj_prune_indices = None
+        self.pruneFlag = False
+        self.pruned = False
 
     def forward(self, x):
         
@@ -208,57 +212,77 @@ class MLP(nn.Module): # somehow only do the pruning step after 100 iterations. k
         # We do this by looking at the weight matrix, which is dx4d, and prune the 0.9d rows with lowest L2 norm.
 
         # IMPORTANT POINT: in the forward c_fc function, the weight matrix is TRANSPOSED. This means that initially, the weight matrix is 4d x d. 
+        # print(self.pruneFlag)
 
-        c_fc_col_indices = None
-        for name, param in self.named_parameters():
-            if name == "c_fc.weight":
-                # Print the row norms of the weight matrix
-                WT = param # this is 4d x d
-                W = WT.transpose(0,1)  # this is d x 4d
-                row_norms = torch.norm(W, dim=1) 
+        print("forward pass", "pruneFlag " + str(self.pruneFlag), "pruned " + str(self.pruned))
+        if self.pruneFlag:
+            for name, param in self.named_parameters():
+                print(param.shape)
+                if name == "c_fc.weight":
+                    # Print the row norms of the weight matrix
+                    WT = param # this is 4d x d
+                    W = WT.transpose(0,1)  # this is d x 4d
+                    row_norms = torch.norm(W, dim=1) 
 
-                largest_row_norms_indices = torch.topk(row_norms, int(0.1*W.size(0)), largest=True, sorted=False)
-                
-                c_fc_col_indices = largest_row_norms_indices.indices
+                    largest_row_norms_indices = torch.topk(row_norms, int(0.1*W.size(0)), largest=True, sorted=False)
+                    
+                    self.c_fc_prune_indices = largest_row_norms_indices.indices
 
-                W_pruned = torch.index_select(W, 0, largest_row_norms_indices.indices)
-                WT_pruned = W_pruned.transpose(0,1)
+                    W_pruned = torch.index_select(W, 0, largest_row_norms_indices.indices)
+                    WT_pruned = W_pruned.transpose(0,1)
 
-                param.data = WT_pruned
-                break
+                    param.data = WT_pruned
+                    break
 
-        # Now, we must select the corresponding columsn in the input matrix x to be pruned.
+            # Now, we must select the corresponding columsn in the input matrix x to be pruned.
 
-        x = self.c_fc(torch.index_select(x, 2, c_fc_col_indices)) # first linear layer. input is matrix of size Nxd where N is batch size and d is embedding dimension. 
-                                                                  # Weights are matrix of size dx4d. Output is matrix of size Nx4d. Mat mul of Nxd * dx4d = Nx4d
-                         
-        x = self.gelu(x)
+            x = self.c_fc(torch.index_select(x, 2, self.c_fc_prune_indices)) # first linear layer. input is matrix of size Nxd where N is batch size and d is embedding dimension. 
+                                                                    # Weights are matrix of size dx4d. Output is matrix of size Nx4d. Mat mul of Nxd * dx4d = Nx4d
 
-        #print(x.shape) # Nx4d
-        c_proj_row_indices = None
-        for name, param in self.named_parameters():
-            if name == "c_proj.weight":
-                # Print the row norms of the weight matrix
-                WT = param
-                W = WT.transpose(0,1) # 4d x d
+            x = self.gelu(x)
 
-                row_norms = torch.norm(W, dim=1)
+            
+            for name, param in self.named_parameters():
+                if name == "c_proj.weight":
+                    # Print the row norms of the weight matrix
+                    WT = param
+                    W = WT.transpose(0,1) # 4d x d
 
-                largest_row_norms_indices = torch.topk(row_norms, int(0.1*W.size(0)), largest=True, sorted=False)
+                    row_norms = torch.norm(W, dim=1)
 
-                c_proj_row_indices = largest_row_norms_indices.indices
+                    largest_row_norms_indices = torch.topk(row_norms, int(0.1*W.size(0)), largest=True, sorted=False)
 
-                W_pruned = torch.index_select(W, 0, largest_row_norms_indices.indices) # (0.1 * 4d) x d
+                    self.c_proj_prune_indices = largest_row_norms_indices.indices
+ 
+                    W_pruned = torch.index_select(W, 0, largest_row_norms_indices.indices) # (0.1 * 4d) x d
 
-                WT_pruned = W_pruned.transpose(0,1)
+                    WT_pruned = W_pruned.transpose(0,1)
 
 
-                param.data = WT_pruned
-                break
-        
-        x = self.c_proj(torch.index_select(x, 2, c_proj_row_indices)) # second linear layer. input is matrix of size Nx4d where N is batch size and d is embedding dimension.
-                                                                      # We prune to get N x (0.1 * 4)d * (0.1 * 4)d x d = Nxd
-        x = self.dropout(x)
+                    param.data = WT_pruned
+                    break
+            
+            x = self.c_proj(torch.index_select(x, 2, self.c_proj_prune_indices)) # second linear layer. input is matrix of size Nx4d where N is batch size and d is embedding dimension.
+                                                                        # We prune to get N x (0.1 * 4)d * (0.1 * 4)d x d = Nxd
+            x = self.dropout(x)
+
+            self.pruneFlag = False
+            self.pruned = True
+
+
+        elif self.pruned:
+            x = self.c_fc(torch.index_select(x, 2, self.c_fc_prune_indices))
+            
+            x = self.gelu(x)
+
+            x = self.c_proj(torch.index_select(x, 2, self.c_proj_prune_indices))
+
+            x = self.dropout(x)
+        else:
+            x = self.c_fc(x)
+            x = self.gelu(x)
+            x = self.c_proj(x)
+            x = self.dropout(x)
         return x
     
     def forward_quantize(self, x, max_vals, prevHierarchy):
