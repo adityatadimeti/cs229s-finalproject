@@ -298,6 +298,12 @@ if prune_type == "zero_indiv" or prune_type == "zero_row":
 #print("Percentage of weight values that equal 0:", percent_zero_values)
 
 
+total_values = 0
+for name, param in model.named_parameters():
+    if "weight" in name:
+        total_values += param.numel()
+
+print("Total number of weight values:", total_values)
 
 while True:
 
@@ -469,23 +475,18 @@ while True:
                     with torch.no_grad(): # freezes the grad for the entire matrix??? or just the mask?
                         param *= mask_dict[name]
     elif (prune_type == "reduce"):
+        file_path_mask = 'reduce_'+str(eval_iters)+'_'+str(batch_size)+'.pickle'
         if (iter_num == prune_at):
-            print("Nah")
+            print("time to prune reduce")
+            for block in model.transformer.h:
+                block.mlp.pruneFlag = True  # Set to True to enable pruning 
+                block.mlp.pruned = False 
             # set model param is_pruning = True for reduction forward call
         else:
             print("You didnt do it ")
-            # set model param is_pruning = False for normal forward call
-
-    # Calculate the percentage of data values across all entries of all weight matrices across all parameters that equal 0
-    total_values = 0
-    zero_values = 0
-    for name, param in raw_model.named_parameters():
-        if "weight" in name:
-            total_values += param.numel()
-            zero_values += (param == 0).sum().item()
-
-    percent_zero_values = (zero_values / total_values) * 100
-    print("Percentage of weight values that equal 0:", percent_zero_values)
+            # for block in model.transformer.h:
+            #     block.mlp.pruneFlag = False  # Set to False to disable pruning. Note this is unlikely to be necessary because 
+            #                                  # prune flag is already set to false inside the individual model.py forward function. 
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
@@ -555,6 +556,15 @@ while True:
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
     iter_num += 1
     local_iter_num += 1
+
+    # Calculate the percentage of data values across all entries of all weight matrices across all parameters that equal 0
+    zero_values = 0
+    for name, param in raw_model.named_parameters():
+        if "weight" in name:
+            zero_values += (param == 0).sum().item()
+
+    percent_zero_values = (zero_values / total_values) * 100
+    print("Percentage of weight values that equal 0:", percent_zero_values)
 
     # termination conditions
     if iter_num > max_iters:
