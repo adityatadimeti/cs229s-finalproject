@@ -192,24 +192,6 @@ class CausalSelfAttention(nn.Module):
 
         return y
 
-class PrunableLinear(nn.Linear):
-    def __init__(self, in_features, out_features, bias=True):
-        super(PrunableLinear, self).__init__(in_features, out_features, bias)
-        self.pruned = False
-
-    def prune(self, pruning_ratio):
-        with torch.no_grad():
-            # Prune based on the L2 norm of the rows
-            row_norms = torch.norm(self.weight, dim=1)
-            num_rows_to_keep = int((1 - pruning_ratio) * self.weight.size(0))
-            top_indices = torch.topk(row_norms, num_rows_to_keep, largest=True).indices
-            
-            self.weight = nn.Parameter(torch.index_select(self.weight, 0, top_indices))
-            if self.bias is not None:
-                self.bias = nn.Parameter(torch.index_select(self.bias, 0, top_indices))
-            self.pruned = True
-
-
 class MLP(nn.Module): # somehow only do the pruning step after 100 iterations. keep track of some global variable / flag???
 
     def __init__(self, config):
