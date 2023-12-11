@@ -20,9 +20,14 @@ max_iters = 600000
 lr_decay_iters = 600000
 
 # eval stuff
-eval_interval = 50
+eval_interval = 10 #change to be 10
 eval_iters = 100
 log_interval = 10
 
+
 # weight decay
 weight_decay = 1e-1
+prune_at = 100
+prune_type = "None"
+prune_percentile = 0.9
+init_from = 'gpt2'
