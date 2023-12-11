@@ -204,6 +204,7 @@ class MLP(nn.Module): # somehow only do the pruning step after 100 iterations. k
         self.c_proj_prune_indices = None
         self.pruneFlag = False
         self.pruned = False
+        self.prune_percentile = None
 
         self.d = config.n_embd
         self.fourD = 4 * config.n_embd
@@ -229,7 +230,7 @@ class MLP(nn.Module): # somehow only do the pruning step after 100 iterations. k
                     W = WT.transpose(0, 1)  # this is d x 4d
                     row_norms = torch.norm(W, dim=1) 
 
-                    largest_row_norms_indices = torch.topk(row_norms, int(0.1*W.size(0)), largest=True, sorted=False)
+                    largest_row_norms_indices = torch.topk(row_norms, int(self.prune_percentile * W.size(0)), largest=True, sorted=False)
                     
                     self.c_fc_prune_indices = largest_row_norms_indices.indices
 
@@ -256,7 +257,7 @@ class MLP(nn.Module): # somehow only do the pruning step after 100 iterations. k
 
                     row_norms = torch.norm(W, dim=1)
 
-                    largest_row_norms_indices = torch.topk(row_norms, int(0.1*W.size(0)), largest=True, sorted=False)
+                    largest_row_norms_indices = torch.topk(row_norms, int(self.prune_percentile * W.size(0)), largest=True, sorted=False)
 
                     self.c_proj_prune_indices = largest_row_norms_indices.indices
 
