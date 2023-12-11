@@ -173,7 +173,15 @@ for k,v in list(state_dict.items()):
 
 model.load_state_dict(state_dict)
 
-batch_size = 12 #change /toggle this batch size from 4 to 12
+modelsize = 0
+for param in model.parameters():
+    modelsize += param.nelement() * param.element_size()
+for buffer in model.buffers():
+    modelsize += buffer.nelement() * buffer.element_size()
+
+print("model size in bytes " + str(modelsize))
+
+batch_size = 4 #change /toggle this batch size from 4 to 12
 
 print("without quantization loss and perplexity")
 losses = estimate_loss(isQuantize=False)
@@ -181,7 +189,7 @@ print(losses)
 
 perplexity = torch.exp(losses['val'])
 print("perplex val " + str(perplexity))
-memory_usage = torch.cuda.max_memory_allocated()
+
 
 print("quantizing the model parameters")
 max_vals = {} #this is a dictionary that maps the name of the parameter to the max value of that parameter
@@ -216,9 +224,14 @@ print(losses)
 
 perplexity = torch.exp(losses['val'])
 print("perplex val " + str(perplexity))
-print("mem usage" + str(torch.cuda.memory_allocated() ))
 
+modelsize = 0
+for param in model.parameters():
+    modelsize += param.nelement() * param.element_size()
+for buffer in model.buffers():
+    modelsize += buffer.nelement() * buffer.element_size()
 
+print("model size in bytes quantized " + str(modelsize))
 
 
 
