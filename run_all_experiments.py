@@ -13,7 +13,7 @@ result = subprocess.run(command,  shell=True, capture_output=True, text=True)
 print(result.stdout)
 print(result.stderr)
 print("Done Training")
-for prune_percentile in [0.9, 0.5, 0.1]:
+for prune_percentile in [0.9]:
     cur_model = "reduce" + "_" + str(prune_percentile)
     print("LOADING RESULTS ON ", cur_model)
     model_results = {}
