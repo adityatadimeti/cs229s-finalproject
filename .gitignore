@@ -8,3 +8,6 @@ __pycache__/
 *.pt
 *.pyc
 input.txt
+229s/lib/
+229s/bin/
+229s/share/

@@ -38,8 +38,8 @@ wandb_run_name = 'gpt2' # 'run' + str(time.time())      #change this to gpt2-med
 # data
 
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
-batch_size = 1 # if gradient_accumulation_steps > 1, this is the micro-batch size
-block_size = 1024
+batch_size = 10 # if gradient_accumulation_steps > 1, this is the micro-batch size
+block_size = 64
 # model
 n_layer = 12
 n_head = 12
@@ -66,26 +66,92 @@ dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported
 compile = False # use PyTorch 2.0 to compile the model to be faster
 top_k = 200 # retain only the top_k most likely tokens, clamp others to have 0 probability
 num_samples = 1 # number of samples to draw
-dataset = 'wikitext'
-data_dir = os.path.join('data', dataset)
-val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
-ctx = nullcontext() if device == 'cpu' else torch.amp.autocast(device_type=device, dtype=ptdtype)
+dataset = 'shakespeare'
 max_new_tokens = 500 # number of tokens generated in each sample
 temperature = 0.8
 
+
+def quantize_param(param): #this data is the param data
+
+    rangemin = -128
+    rangemax = 127
+    
+    maxval = torch.max(torch.abs(param))
+    scaling_factor = rangemax / maxval
+    scaled_tensor = param * scaling_factor
+
+    clipped_tensor = torch.clamp(scaled_tensor, rangemin, rangemax)
+    quantized_tensor = clipped_tensor.to(torch.int8)
+    quantized_tensor.requires_grad = False
+    return quantized_tensor, maxval
+    
+
+def dequantize_param(param, maxval):
+    rangemax = 127
+    dequantized_tensor = param / rangemax * maxval
+    dequantized_tensor = dequantized_tensor.to(torch.float32)
+    return dequantized_tensor
+
+
+ckpt_path = os.path.join("pretrained", 'ckpt.pt') #this model has already been finetuned, so just load it in
+checkpoint = torch.load(ckpt_path, map_location=device)
+checkpoint_model_args = checkpoint['model_args']
+
+gptconf = GPTConfig(**checkpoint['model_args'])
+model = GPT(gptconf)
+model.to(device)
+state_dict = checkpoint['model']
+
+unwanted_prefix = '_orig_mod.'
+
+for k,v in list(state_dict.items()):
+        if k.startswith(unwanted_prefix):
+            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+
+model.load_state_dict(state_dict)
+
+print("quantizing the model parameters")
+max_vals = {} #this is a dictionary that maps the name of the parameter to the max value of that parameter
+print("param names")
+for name, param in model.named_parameters():
+    if ".wte." in name or ".wpe." in name or "weight" in name or "bias" in name:
+        quantized_tensor, maxval = quantize_param(param.data)
+        #print(name + "_maxval")
+        max_vals[name+"_maxval"] = maxval
+        #assign the quantized tensor back to the model parameter
+        #print(f"data before assigning to state dict =  {state_dict[name].dtype}")
+        param.requires_grad = False
+        #param.dtype = torch.int8
+        state_dict[name] = state_dict[name].to(torch.int8)
+        param.data = quantized_tensor
+        state_dict[name].copy_(param)
+        #print(str(param.data.dtype) + " right now")
+        #print(f"data type after assigning to state dict: {state_dict[name].dtype}")
+        #print(f"data type after assigning to state dict: {param.dtype}")
+        #setattr(name + "_maxval", maxval)
+
+device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
+print("at this point i've replaced the model parameters with the quantized parameters")
+
+# poor man's data loader
+ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
+ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+data_dir = os.path.join('data', dataset)
+train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
 def get_batch(split):
-    data  = val_data
+    data = train_data if split == 'train' else val_data
     ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
-    if device == 'cuda':
+    if device_type == 'cuda':
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
     else:
         x, y = x.to(device), y.to(device)
     return x, y
 
+finalLogits = None
 @torch.no_grad()
 def estimate_loss():
     out = {}
@@ -95,117 +161,17 @@ def estimate_loss():
         for k in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
-                logits, loss = model(X, Y)
+                logits, loss = model.forward_quantize(X, Y, max_vals=max_vals)
+                finalLogits = logits
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
     return out
 
-enc = tiktoken.get_encoding("gpt2")
-encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
-decode = lambda l: enc.decode(l)
-
-start = "\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
-if start.startswith('FILE:'):
-    with open(start[5:], 'r', encoding='utf-8') as f:
-        start = f.read()
-start_ids = encode(start)
-x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
-
-#PART 1 VALIDATION LOSS ON WIKITEXT
-ckpt_path = os.path.join("wikitext", 'ckpt.pt') #this model has already been finetuned, so just load it in
-checkpoint = torch.load(ckpt_path, map_location=device)
-checkpoint_model_args = checkpoint['model_args']
-trainTime = checkpoint['timeSeconds']
-
-gptconf = GPTConfig(**checkpoint['model_args'])
-model = GPT(gptconf)
-model.to(device)
-
-t = time.time()
-with torch.no_grad():
-    with ctx:
-        for k in range(num_samples):
-            y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k, isQuantize=False)
-            print(decode(y[0].tolist()))
-            print('---------------')
-timeCompletedInference = time.time() - t
-tokens_generated = x.size(0) * num_samples * max_new_tokens
 losses = estimate_loss()
-totalTokens = num_iters * batch_size * block_size * gradient_accumulation_steps
+print(losses)
 
-print("VALIDATION LOSS STUFF " + losses)
-print("INFERENCE LATENCY - TIME/SECONDS: " + timeCompletedInference)
-print("INFERENCE LATENCY - TOKENS: " + totalTokens)
-print("THROUGHPUT SAMPLES: " + train_num_samples)
-print("THROUGHPUT TIME/SECONDS: " + trainTime)
+#code the calculation to the perplexity score now
 
 
 
-#PART 2 AND 3 - INF LATENCY 
-""" train_quality_command = f"python train.py config/train_shakespeare.py --device=cpu --compile=False --eval_iters=1 --log_interval=1 --block_size=64 --batch_size=8 --n_layer=4 --n_head=4 --n_embd=128 --max_iters=2 --lr_decay_iters=2000 --dropout=0.0 --gradient_accumulation_steps=40 --dataset=shakespeare"
-time1 = time.time()
-result = subprocess.run(train_quality_command, shell=True, capture_output=True, text=True)
-time2 = time.time()
-print(result.stdout) """
-
-# @torch.no_grad()
-# def estimate_inference_time(samples, batch_size):
-#     t = time.time()
-#     for i in range(samples):
-#         X,Y = get_batch('train', batch_size)
-#         with ctx:
-#             _, loss = model(X,Y)
-#     return samples/(time.time() - t)
-
-# def estimate_train_time(samples, batch_size):
-#     t = time.time()
-#     for i in range(samples):
-#         X,Y = get_batch('train', batch_size)
-#         with ctx:
-#             _, loss = model(X,Y)
-#             loss.backward()
-#     rate = samples/(time.time() - t)
-#     optimizer.zero_grad(set_to_none=True)
-#     return rate
-
-
-# def experiment_train(params):
-#     command = f"python train.py {params['config_file']} --eval_iters={params['eval_iters']} --log_interval={params['log_interval']}  --max_iters={params['max_iters']} --lr_decay_iters={params['lr_decay_iters']} --dropout={params['dropout']}"
-#     print(command)
-#     command = f"python train.py config/train_shakespeare.py --device=cpu --compile=False --eval_iters=20 --log_interval=1 --block_size=64 --batch_size=12 --n_layer=4 --n_head=4 --n_embd=128 --max_iters=2 --lr_decay_iters=2000 --dropout=0.0"
-#     time1 = time.time()
-#     result = subprocess.run(command, shell=True, capture_output=True, text=True)
-#     time2 = time.time()
-#     print(result.stdout)
-#     return result, (time2 - time1)
-
-# def experiment_test(params):
-#     command = f"python sample.py --out_dir={params['out_dir']} --start={params['start']} --num_samples={params['num_samples']} --max_new_tokens={params['max_new_tokens']} --device=cpu"
-#     time1 = time.time()
-#     result = subprocess.run(command, shell=True, capture_output=True, text=True)
-#     time2 = time.time()
-#     return result
-
-# #train_params_8 = {"config_file": "config/train_wikitext.py", "eval_iters": 100, "log_interval": 1, "max_iters": 2, "lr_decay_iters": 500, "dropout": 0.0, "batch_size": 8}
-# #train_params_1 = {"config_file": "config/train_wikitext.py", "eval_iters": 100, "log_interval": 1, "max_iters": 2, "lr_decay_iters": 500, "dropout": 0.0, "batch_size": 1}
-# #train_params_12 = {"config_file": "config/train_wikitext.py", "eval_iters": 100, "log_interval": 1, "max_iters": 2, "lr_decay_iters": 500, "dropout": 0.0, "batch_size": 12}
-# #train_result_8, train_time_8 = experiment_train(train_params_8)
-
-# test_params_1 = {"out_dir": "shakespeare", "start": "\'What is the answer to life, the universe, and everything?\'", "num_samples": 1, "max_new_tokens": 100}
-# test_params_12 = {"out_dir": "shakespeare", "start": "\'What is the answer to life, the universe, and everything?\'", "num_samples": 12, "max_new_tokens": 100}
-# test_result_1 = experiment_test(test_params_1)
-# test_result_12 = experiment_test(test_params_12)
-
-# #train_8_logs = str(train_result_8.stdout).split(" ")
-# #last_occurrence_index = len(train_8_logs) - train_8_logs[::-1].index("val") - 1
-# #val_loss = float(train_8_logs[last_occurrence_index+2])
-# # train_samples
-# #train_throughput = train_samples / train_time
-# print(test_result_1.stdout)
-# inference_latency_1 = float(str(test_result_1.stdout).split()[-2])
-# inference_latency_12 = float(str(test_result_12.stdout).split()[-2])
-# print(inference_latency_1, inference_latency_12)
-# metric_dict = {"inference_latency_1": inference_latency_1, "inference_latency_12": inference_latency_12}
-# with open("run.json", "w") as outfile:
-#     json.dump(metric_dict, outfile)

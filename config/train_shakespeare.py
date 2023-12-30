@@ -6,7 +6,7 @@ out_dir = 'shakespeare'
 #eval_interval = 10
 #eval_iters = 50
 eval_interval = 1
-eval_iters = 4
+eval_iters = 1
 
 # logging
 #log_interval = 10
@@ -24,10 +24,10 @@ always_save_checkpoint = False
 # the number of examples per iter:
 # 1 batch_size * 32 grad_accum * 1024 tokens = 32,768 tokens/iter
 # shakespeare has 301,966 tokens, so 1 epoch ~= 9.2 iters
-batch_size = 8
+batch_size = 1
 gradient_accumulation_steps = 40
 #max_iters = 200
-max_iters = 4
+max_iters = 1
 
 # finetune at constant LR
 learning_rate = 3e-5

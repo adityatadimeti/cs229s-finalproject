@@ -16,16 +16,11 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 
-def dequantize_helper(param, maxval):
+def dequantize_param_helper(param, maxval):
     rangemax = 127.
     dequantized_tensor = param.to(torch.float32)
     dequantized_tensor = dequantized_tensor / rangemax * maxval
     return dequantized_tensor
-
-    #this is the zero-point version to dequantize, scales and zeropoint need to be pased in
-    # dequantized_tensor = param.to(torch.float32)
-    # dequantized_tensor = (dequantized_tensor - zero_point) / scale
-    # return dequantized_tensor
 
 def dequantize_and_update(module, self, paramname, max_vals, prevHierarchy):
     #module is the actual param data
@@ -34,7 +29,7 @@ def dequantize_and_update(module, self, paramname, max_vals, prevHierarchy):
     else:
         fullname = paramname
     #print("MODULE DTYPE " + str(module.dtype))
-    dequantized_module = dequantize_helper(module, max_vals[fullname + "_maxval"])
+    dequantized_module = dequantize_param_helper(module, max_vals[fullname + "_maxval"])
     self.state_dict()[paramname] = self.state_dict()[paramname].to(torch.float32)
     module.data = dequantized_module
     self.state_dict()[paramname].copy_(dequantized_module)
@@ -64,7 +59,7 @@ class LayerNorm(nn.Module):
         for name, param in self.named_parameters():
             #print("PARAM DTYPE " + str(param.dtype))
             fullname = prevHierarchy +"." + name
-            dequantized = dequantize_helper(param, max_vals[fullname + "_maxval"])
+            dequantized = dequantize_param_helper(param, max_vals[fullname + "_maxval"])
             self.state_dict()[name] = self.state_dict()[name].to(torch.float32)
             ogvals[fullname] = param.data.clone()
             param.data = dequantized
@@ -78,7 +73,7 @@ class LayerNorm(nn.Module):
         #print("after calling the dequantize function, the data type " + str(self.bias.dtype))
         layer_norm_output = F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
-        #re-quantize
+        #re-quantize by using the original values we saved/cached
         for name, param in self.named_parameters():
             #quantized, maxval = quantize_helper(param)
             fullname = prevHierarchy +"."+ name
@@ -141,6 +136,7 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         return y
     
+    #same logic as the previous forward function, but dequantize the model weights
     def forward_quantize(self, x, max_vals, prevHierarchy):
         B, T, C = x.size()
 
@@ -198,6 +194,7 @@ class MLP(nn.Module):
         x = self.dropout(x)
         return x
     
+    #same logic as the previous forward function, but dequantize the model weights
     def forward_quantize(self, x, max_vals, prevHierarchy):
         og_weight = self.c_fc.weight.clone()
         dequantize_and_update(self.c_fc.weight, self, "c_fc.weight", max_vals, prevHierarchy)
@@ -208,6 +205,7 @@ class MLP(nn.Module):
         update_data(self.c_fc.weight, og_weight, self, "c_fc.weight")
         update_data(self.c_fc.bias, og_bias, self, "c_fc.bias")
 
+        #in future instead of using this library call, we can write our own gelu and make a quantized version
         x = self.gelu(x)
 
         og_weight = self.c_proj.weight.clone()
@@ -236,6 +234,8 @@ class Block(nn.Module):
         x = x + self.mlp(self.ln_2(x))
         return x
     
+    #same logic as the previous forward function, but dequantize the model weights, 
+    #we pass in the index count to be able to get the right model parameter for the head/block that we are at
     def forward_quantize(self, x, max_vals, indexcount):
         #print(indexcount)
         #transformer.h.11.ln_1.weight
@@ -333,7 +333,7 @@ class GPT(nn.Module):
 
         return logits, loss
     
-
+    #same logic as the previous forward function, but dequantize the model weights
     def forward_quantize(self, idx, targets=None, max_vals=None, myFlag=False):
         device = idx.device
         b, t = idx.size()
@@ -491,6 +491,7 @@ class GPT(nn.Module):
         mfu = flops_achieved / flops_promised
         return mfu
 
+    #add the quantize flags so we run the appropriate forward function
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, isQuantize = False, max_vals=None):
         """
@@ -524,8 +525,8 @@ class GPT(nn.Module):
 
         return idx
     
+    #borrowed from our previous assignment, made modifications to account for quantization
     @torch.no_grad()
-    
     def generate_speculative(self, idx, max_new_tokens, draft_model, temperature=1.0, top_k=None, num_speculative=4, isMainModelQuantize=False, isDraftModelQuantize=False, max_vals=None):
    
         idx_length_original = idx.size(1)
@@ -552,6 +553,7 @@ class GPT(nn.Module):
             if(isMainModelQuantize):
                 all_logits, _ = self.forward_quantize(idx_speculative, myFlag=True, max_vals=max_vals)
             else:
+                #print(idx_speculative.size())
                 all_logits, _ = self.forward(idx_speculative, myFlag=True)
             
             ### END YOUR CODE HERE
