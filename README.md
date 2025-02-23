@@ -1,9 +1,7 @@
 
 # nanoGPT
 
-## CS 229s
-
-We will be building off of this codebase for the [CS 229s Systems for Machine Learning](https://cs229s.stanford.edu/fall2023/) default final project option. The project training will be on the Wikitext103 language modeling dataset (which will be automatically downloaded from huggingface). You can also use a Shakespeare dataset to help debug (this dataset is tiny!).
+Training will be on the Wikitext103 language modeling dataset (which will be automatically downloaded from huggingface). You can also use a Shakespeare dataset to help debug (this dataset is tiny!).
 
 This repo includes ```prepare.py``` scripts to prepare the datasets for training:
 - ```python data/wikitext/prepare.py```
